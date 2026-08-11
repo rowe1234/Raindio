@@ -17,4 +17,5 @@ Visual styles inspired by:
 - **Minecraft**: 1.20 – 1.21  
 - **Iris** 1.7+ (OptiFine is not officially supported)
 
-## Dev Environment : MacOS
+## Dev Environment
+- MacOS
