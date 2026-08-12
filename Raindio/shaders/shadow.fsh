@@ -1,9 +1,13 @@
 #version 120
 
 varying vec4 vTexCoord;
+varying vec4 vColor;
+
 uniform sampler2D texture;
 
 void main() {
-    // Depth written automatically by rasterization
-    // Alpha-tested discard removed — all geometry casts shadows
+    vec4 albedo = texture2D(texture, vTexCoord.st) * vColor;
+    if (albedo.a < 0.1) {
+        discard;
+    }
 }
