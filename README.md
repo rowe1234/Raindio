@@ -19,4 +19,5 @@ Visual styles inspired by:
 ## Dev Environment
 - MacOS
 
+## Game Graphics
 - <img width="3360" height="1984" alt="2026-08-12_10 50 20" src="https://github.com/user-attachments/assets/82cb4bb8-0f45-4718-bb22-2b34d2d96d64" />
