@@ -1,9 +1,6 @@
 #version 120
 /* DRAWBUFFERS:1 */
 
-// Writes only to colortex1 — colortex0 remains "pure" (terrain-lit)
-// colortex1: (normal.xyz * 0.5 + 0.5, waterFlag=0.79)
-
 varying vec4 vTexCoord;
 varying vec3 vNormal;
 varying float vIsWater;
