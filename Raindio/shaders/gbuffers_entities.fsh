@@ -3,19 +3,13 @@
 
 #define PI 3.14159265359
 
-// =================【亮度快捷调节杠杆】=================
-#define EMISSIVE_BRIGHTNESS 1.2
-// ========================================================
-
 varying vec3 vNormal;
 varying vec4 vColor;
 varying vec4 vTexCoord;
 varying vec3 vEyePos;
 varying vec2 vLightmap;
-varying float vBlockId;
 
-varying float vEmissive;
-
+// 优化：引入顶点着色器已算好的 Varying 变量，避免逐像素计算
 varying vec3 vSkyColor;
 varying vec3 vSunlight;
 varying float vDayFactor;
@@ -23,23 +17,26 @@ varying float vSunIntensity;
 
 uniform sampler2D texture;
 uniform sampler2D lightmap;
+uniform sampler2D shadowtex0;
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
-uniform sampler2D shadowtex0;
+uniform mat4 gbufferModelView;
 uniform mat4 shadowProjection;
 uniform mat4 shadowModelView;
-uniform mat4 gbufferModelView;
+
 uniform sampler2D specular;
 
-// =================【雨天湿地 Uniform】=================
-uniform float rainStrength;
-uniform float frameTimeCounter;
-uniform vec3 cameraPosition;
+float CurveBlockLightSky(float blockLight) {
+    float inv = 1.0 - blockLight;
+    float sq = inv * inv;
+    float res = 1.0 - sq * sqrt(inv);
+    return res * res * res;
+}
 
 const float SHADOW_RES = 4096.0;
-const float LIGHT_SIZE = 0.8;     
-const float MAX_PENUMBRA = 8.0;   
-const float MIN_PENUMBRA = 0.8;   
+const float LIGHT_SIZE = 2.5;
+const float MAX_PENUMBRA = 6.0;
+const float MIN_PENUMBRA = 0.6;
 
 const vec2 poissonDisk[16] = vec2[](
     vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
@@ -51,15 +48,6 @@ const vec2 poissonDisk[16] = vec2[](
     vec2(-0.24188840, 0.99706507),  vec2(-0.81409955, 0.91437590),
     vec2(0.19984126, 0.78641367),   vec2(0.14383161, -0.14100790)
 );
-
-float saturate(float x) { return clamp(x, 0.0, 1.0); }
-
-float CurveBlockLightSky(float blockLight) {
-    float inv = 1.0 - blockLight;
-    float sq = inv * inv;
-    float res = 1.0 - sq * sqrt(inv);
-    return res * res * res;
-}
 
 float interleavedGradientNoise() {
     return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
@@ -81,19 +69,23 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     vec3 shadowCoord = shadowNDC * 0.5 + 0.5;
 
     if (shadowCoord.x < 0.001 || shadowCoord.x > 0.999 || 
-        shadowCoord.y < 0.001 || shadowCoord.y > 0.999 || 
+        shadowCoord.y < 0.001 || shadowCoord.y > 0.999 ||
         shadowCoord.z < 0.000 || shadowCoord.z > 1.000) {
         return 1.0;
     }
 
     float slope = sqrt(clamp(1.0 - NdotL_eff * NdotL_eff, 0.0, 1.0));
-    float receiverDepth = shadowCoord.z - (0.00006 + 0.00012 * slope) / distortFactor;
+    float bias = (0.00006 + 0.00012 * slope) / distortFactor;
+    if (isThin) bias *= 0.2;
+
+    float receiverDepth = shadowCoord.z - bias;
 
     const float oneTexel = 1.0 / SHADOW_RES;
     float searchRadius = (LIGHT_SIZE * oneTexel) / distortFactor;
     
     int blockerCount = 0;
     float blockerDepthSum = 0.0;
+
     for (int i = 0; i < 12; i++) {
         float sampleDepth = texture2D(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius).r;
         if (sampleDepth < receiverDepth) {
@@ -108,10 +100,13 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     float penumbra = (receiverDepth - avgBlockerDepth) / max(avgBlockerDepth, 0.00001);
     float filterRadius = clamp(penumbra * LIGHT_SIZE * 25.0, MIN_PENUMBRA, MAX_PENUMBRA);
 
-    float randomAngle = interleavedGradientNoise() * 6.2831853;
-    mat2 rotationMatrix = mat2(cos(randomAngle), sin(randomAngle), -sin(randomAngle), cos(randomAngle));
+    float randomAngle = interleavedGradientNoise() * 6.28318530718;
+    float cosA = cos(randomAngle);
+    float sinA = sin(randomAngle);
+    mat2 rotationMatrix = mat2(cosA, sinA, -sinA, cosA);
 
     float shadowSum = 0.0;
+    // 优化：将缩放与旋转矩阵提前合并，减少循环内向量乘法
     float stepScale = (filterRadius * oneTexel) / distortFactor;
     mat2 scaledRot = rotationMatrix * stepScale;
 
@@ -123,13 +118,13 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     float shadow = shadowSum * 0.0833333;
     vec2 edgeDist = abs(shadowCoord.st - 0.5) * 2.0;
     float fade = 1.0 - smoothstep(0.85, 0.98, max(edgeDist.x, edgeDist.y));
+
     return mix(1.0, shadow, fade);
 }
 
 float GGX_D(float NdotH, float roughness) {
     float a2 = roughness * roughness * roughness * roughness;
-    float NdotHSq = NdotH * NdotH;
-    float denom = NdotHSq * (a2 - 1.0) + 1.0;
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
     return a2 / (PI * denom * denom);
 }
 
@@ -143,61 +138,22 @@ float GGX_G(float NdotL, float NdotV, float roughness) {
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    float m = 1.0 - cosTheta;
+    float m = 1.0 - cosTheta; // 优化：移除多余 clamp
     float m2 = m * m;
     return F0 + (1.0 - F0) * (m2 * m2 * m);
-}
-
-void getDefaultMetalnessRoughness(float blockId, out float metalness, out float roughness) {
-    bool isMetal = (blockId == 41.0 || blockId == 42.0 || blockId == 57.0 || blockId == 133.0);
-    metalness = isMetal ? ((blockId == 133.0) ? 0.8 : 1.0) : 0.0;
-    
-    roughness = 0.8;
-    if (blockId == 57.0) roughness = 0.1;
-    else if (blockId == 41.0) roughness = 0.2;
-    else if (blockId == 42.0) roughness = 0.3;
-    else if (blockId == 133.0) roughness = 0.4;
-    else if (blockId == 2.0) roughness = 0.65;
 }
 
 void main() {
     vec4 albedo = texture2D(texture, vTexCoord.st) * vColor;
     if (albedo.a < 0.1) discard;
 
-    bool isThin = (albedo.a < 0.99) || 
-                  (vBlockId >= 31.0 && vBlockId <= 38.0) || 
-                  (vBlockId >= 85.0 && vBlockId <= 113.0) || 
-                  (vBlockId >= 188.0 && vBlockId <= 192.0) || 
-                  vBlockId == 6.0 || vBlockId == 59.0 || vBlockId == 175.0;
-
     vec4 specMap = texture2D(specular, vTexCoord.st);
-    float defaultMetal, defaultRough;
-    getDefaultMetalnessRoughness(vBlockId, defaultMetal, defaultRough);
-
     bool hasSpecMap = (specMap.r >= 0.01 || specMap.g >= 0.01);
-    float metalness = hasSpecMap ? specMap.r : defaultMetal;
-    float roughness = max(hasSpecMap ? specMap.g : defaultRough, 0.04);
+    float metalness = hasSpecMap ? specMap.r : 0.0;
+    float roughness = max(hasSpecMap ? specMap.g : 0.8, 0.04);
 
     vec3 N = normalize(vNormal);
     vec3 V = normalize(-vEyePos);
-
-    vec4 lm = texture2D(lightmap, vLightmap);
-
-    // =================【全地面统一湿润系统（无积水坑）】=================
-    if (rainStrength > 0.001) {
-        vec3 worldNormal = normalize((gbufferModelViewInverse * vec4(N, 0.0)).xyz);
-        
-        float skyExposure = smoothstep(0.4, 0.85, lm.y);
-        float upFactor = clamp(worldNormal.y * 0.7 + 0.3, 0.0, 1.0); // 顶面主打湿，立面微湿
-        float totalWetness = saturate(rainStrength) * skyExposure * upFactor;
-
-        // 1. 全地面统一适度吸光变暗
-        albedo.rgb *= mix(1.0, 0.65, totalWetness);
-
-        // 2. 全地面粗糙度统一降低（表现为整体湿润的高光/平滑水膜质感）
-        roughness = mix(roughness, 0.12, totalWetness);
-    }
-    // =====================================================================
 
     vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
     float sunHeight = worldSunDir.y;
@@ -212,18 +168,19 @@ void main() {
 
     float shadow = 1.0;
     float shadowStrength = smoothstep(-0.02, 0.15, sunHeight);
-    if (sunHeight > -0.01 && (NdotL_raw > 0.001 || isThin)) {
+    if (sunHeight > -0.01 && NdotL_raw > 0.001) {
         mat4 viewToShadow = shadowProjection * shadowModelView * gbufferModelViewInverse;
-        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, isThin, viewToShadow), shadowStrength);
+        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, false, viewToShadow), shadowStrength);
     }
 
+    vec4 lm = texture2D(lightmap, vLightmap);
     float skyAmbient = CurveBlockLightSky(lm.y);
     float skyDirect  = lm.y * lm.y;
     float blockLight = pow(lm.x, 2.5);
 
+    // 直接使用顶点着色器传过来的 Varying 预计算变量，删除了原本在此处的冗余计算
     vec3 directLightColor = mix(vSunlight, vSkyColor, 0.15 * (1.0 - vDayFactor));
-    float rainSunFade = mix(1.0, 0.25, saturate(rainStrength));
-    vec3 lightColor = directLightColor * skyDirect * (2.2 * vSunIntensity) * rainSunFade;
+    vec3 lightColor = directLightColor * skyDirect * (2.2 * vSunIntensity);
 
     vec3 albedoColor = albedo.rgb;
     vec3 F0 = mix(vec3(0.04), albedoColor, metalness);
@@ -237,7 +194,6 @@ void main() {
     vec3 specularColor = kS * D * G / max(4.0 * NdotL * NdotV, 0.001);
 
     specularColor *= (1.0 + 0.5 * smoothstep(0.5, 1.0, metalness));
-    if (vBlockId == 2.0) specularColor *= 2.0;
 
     vec3 directDiffuse = diffuse * lightColor * shadow;
     vec3 directSpecular = specularColor * lightColor * (shadow * NdotL);
@@ -256,27 +212,15 @@ void main() {
     vec3 metalSunGradient = F0 * lightColor * (NdotL * shadow * 0.28 * metalness);
 
     float torchRange = 1.0 - blockLight;
-    vec3 customLightColor = vec3(1.0, 0.4, 0.1); 
-    float torchRainBoost = mix(1.0, 1.8, saturate(rainStrength)); // 雨天方块光强度提升 80%
-    vec3 torchLight = customLightColor * (blockLight * (1.0 + torchRange * 0.3) * 0.45 * torchRainBoost);
-    
-    float torchNdotL = max(dot(N, vec3(0.0, 0.8, 0.2)), 0.1);
-    vec3 torchContribution = albedoColor * (1.0 - metalness * 0.7) * torchLight * (torchNdotL / PI);
+    vec3 torchLight = vec3(1.0, 0.52, 0.18) * (blockLight * (1.0 + torchRange * 0.3) * 0.18);
+    float torchNdotL = max(dot(N, vec3(0.0, -1.0, 0.0)), 0.0);
+    vec3 torchContribution = albedoColor * (1.0 - metalness * 0.7) * torchLight * torchNdotL / PI;
 
     float minLightStr = 0.003 * (1.0 - skyDirect) + 0.008;
     vec3 minLight = mix(albedoColor, F0, metalness) * vec3(0.02, 0.025, 0.045) * minLightStr;
 
     vec3 color = ambient + directDiffuse + directSpecular + metalSunGradient + torchContribution + minLight;
 
-    // 2. 为发光方块（荧石/火把等）加入雨天动态增强倍率
-    if (vEmissive > 0.0) {
-        vec3 rawTexture = albedoColor;
-        float emissiveRainBoost = mix(1.0, 2.5, saturate(rainStrength)); // 雨天自发光强度提升至 2.5 倍
-        vec3 glowingColor = rawTexture * (1.0 + vEmissive * EMISSIVE_BRIGHTNESS * emissiveRainBoost);
-        color = mix(color, glowingColor, vEmissive);
-    }
-    gl_FragData[0] = vec4(color, albedo.a);
-    float waterFlag = (vBlockId == 8.0 || vBlockId == 9.0 || vBlockId == 79.0) ? 0.79 : 1.0;
-
-    gl_FragData[1] = vec4(N.xy * 0.5 + 0.5, waterFlag, lm.y);
+    gl_FragData[0] = vec4(color, 1.0);
+    gl_FragData[1] = vec4(N.xy * 0.5 + 0.5, 0.0, 1.0);
 }
