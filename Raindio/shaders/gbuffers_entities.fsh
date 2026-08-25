@@ -1,19 +1,19 @@
-#version 120
+#version 410 core
 /* DRAWBUFFERS:01 */
 
 #define PI 3.14159265359
 
-varying vec3 vNormal;
-varying vec4 vColor;
-varying vec4 vTexCoord;
-varying vec3 vEyePos;
-varying vec2 vLightmap;
+in vec3 vNormal;
+in vec4 vColor;
+in vec4 vTexCoord;
+in vec3 vEyePos;
+in vec2 vLightmap;
 
 // 优化：引入顶点着色器已算好的 Varying 变量，避免逐像素计算
-varying vec3 vSkyColor;
-varying vec3 vSunlight;
-varying float vDayFactor;
-varying float vSunIntensity;
+in vec3 vSkyColor;
+in vec3 vSunlight;
+in float vDayFactor;
+in float vSunIntensity;
 
 uniform sampler2D texture;
 uniform sampler2D lightmap;
@@ -38,7 +38,7 @@ const float LIGHT_SIZE = 2.5;
 const float MAX_PENUMBRA = 6.0;
 const float MIN_PENUMBRA = 0.6;
 
-const vec2 poissonDisk[16] = vec2[](
+const vec2 poissonDisk[16] = vec2[16](
     vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
     vec2(-0.094184101, -0.92938870), vec2(0.34495938, 0.29387760),
     vec2(-0.91588581, 0.45771432),  vec2(-0.81544232, -0.87912464),
@@ -87,7 +87,7 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     float blockerDepthSum = 0.0;
 
     for (int i = 0; i < 12; i++) {
-        float sampleDepth = texture2D(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius).r;
+        float sampleDepth = texture(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius).r;
         if (sampleDepth < receiverDepth) {
             blockerCount++;
             blockerDepthSum += sampleDepth;
@@ -112,7 +112,7 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
 
     for (int i = 0; i < 12; i++) {
         vec2 sampleUV = shadowCoord.st + scaledRot * poissonDisk[i];
-        shadowSum += (receiverDepth > texture2D(shadowtex0, sampleUV).r) ? 0.0 : 1.0;
+        shadowSum += (receiverDepth > texture(shadowtex0, sampleUV).r) ? 0.0 : 1.0;
     }
 
     float shadow = shadowSum * 0.0833333;
@@ -143,11 +143,14 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * (m2 * m2 * m);
 }
 
+layout(location = 0) out vec4 fragData0;
+layout(location = 1) out vec4 fragData1;
+
 void main() {
-    vec4 albedo = texture2D(texture, vTexCoord.st) * vColor;
+    vec4 albedo = texture(texture, vTexCoord.st) * vColor;
     if (albedo.a < 0.1) discard;
 
-    vec4 specMap = texture2D(specular, vTexCoord.st);
+    vec4 specMap = texture(specular, vTexCoord.st);
     bool hasSpecMap = (specMap.r >= 0.01 || specMap.g >= 0.01);
     float metalness = hasSpecMap ? specMap.r : 0.0;
     float roughness = max(hasSpecMap ? specMap.g : 0.8, 0.04);
@@ -173,7 +176,7 @@ void main() {
         shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, false, viewToShadow), shadowStrength);
     }
 
-    vec4 lm = texture2D(lightmap, vLightmap);
+    vec4 lm = texture(lightmap, vLightmap);
     float skyAmbient = CurveBlockLightSky(lm.y);
     float skyDirect  = lm.y * lm.y;
     float blockLight = pow(lm.x, 2.5);
@@ -221,6 +224,6 @@ void main() {
 
     vec3 color = ambient + directDiffuse + directSpecular + metalSunGradient + torchContribution + minLight;
 
-    gl_FragData[0] = vec4(color, 1.0);
-    gl_FragData[1] = vec4(N.xy * 0.5 + 0.5, 0.0, 1.0);
+    fragData0 = vec4(color, 1.0);
+    fragData1 = vec4(N.xy * 0.5 + 0.5, 0.0, 1.0);
 }

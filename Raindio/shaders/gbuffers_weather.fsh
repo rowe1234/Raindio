@@ -1,4 +1,4 @@
-#version 120
+#version 410 core
 
 void main() {
     // 拦截并丢弃现代 MC 原版的天空雨雪与地面击打水花

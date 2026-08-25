@@ -1,4 +1,4 @@
-#version 120
+#version 410 core
 
 // =============================================================================
 // Shader Options (OptiFine / Iris 菜单调控选项)
@@ -12,12 +12,14 @@
 #define LUMA_GAMMA 1.2  // [0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.3 1.4 1.5]
 #define WHITE_CLIP 1.0  // [0.7 0.8 0.85 0.9 0.95 1.0]
 
-varying vec2 texCoord;
+in vec2 texCoord;
 
 uniform sampler2D colortex0;
 
+out vec4 fragColor;
+
 void main() {
-    vec3 color = texture2D(colortex0, texCoord).rgb;
+    vec3 color = texture(colortex0, texCoord).rgb;
 
     // =========================================================================
     // COLOR GRADING (调色系统)
@@ -40,10 +42,10 @@ void main() {
 #ifdef FXAA
     vec2 texelSize = vec2(1.0 / 1920.0, 1.0 / 1080.0);
 
-    vec3 cUp    = texture2D(colortex0, texCoord + vec2(0.0, texelSize.y)).rgb;
-    vec3 cDown  = texture2D(colortex0, texCoord - vec2(0.0, texelSize.y)).rgb;
-    vec3 cLeft  = texture2D(colortex0, texCoord - vec2(texelSize.x, 0.0)).rgb;
-    vec3 cRight = texture2D(colortex0, texCoord + vec2(texelSize.x, 0.0)).rgb;
+    vec3 cUp    = texture(colortex0, texCoord + vec2(0.0, texelSize.y)).rgb;
+    vec3 cDown  = texture(colortex0, texCoord - vec2(0.0, texelSize.y)).rgb;
+    vec3 cLeft  = texture(colortex0, texCoord - vec2(texelSize.x, 0.0)).rgb;
+    vec3 cRight = texture(colortex0, texCoord + vec2(texelSize.x, 0.0)).rgb;
 
     float lumaCenter = dot(color, lumaWeights);
     float lumaUp     = dot(cUp, lumaWeights);
@@ -60,5 +62,5 @@ void main() {
     }
 #endif
 
-    gl_FragColor = vec4(color, 1.0);
+    fragColor = vec4(color, 1.0);
 }

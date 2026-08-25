@@ -1,4 +1,4 @@
-#version 120
+#version 410 core
 /* DRAWBUFFERS:078 */
 
 #define EXPOSURE 1.5           // [0.5 0.8 1.0 1.2 1.5 1.8 2.0 2.5 3.0]
@@ -23,7 +23,10 @@
 #define SSGI_STEPS 8          // [4 6 8 10 12]
 #define SSGI_RADIUS 1.5        // [0.5 1.0 1.5 2.0 3.0]
 
-varying vec2 texCoord;
+// ---- 2D 云层开关（使用 const bool 避免宏解析错误） ----
+const bool CLOUD2D_ENABLED = true;   // 设为 false 可关闭云层
+
+in vec2 texCoord;
 
 uniform sampler2D colortex0;
 uniform sampler2D colortex1;
@@ -165,6 +168,14 @@ vec3 apply_terrain_fog(vec3 color, vec3 viewPos) {
     float fogFactor = 1.0 - exp(-viewDist * dynamicFogDensity);
     return mix(color, fogAtmColor, fogFactor);
 }
+vec3 apply_underwater_fog(vec3 color, vec3 viewPos, float nightDim) {
+    float dist = length(viewPos);
+    vec3 absorb = exp(vec3(-0.32, -0.14, -0.05) * dist);
+    vec3 absorbedColor = color * absorb;
+    float fogFactor = 1.0 - exp(-dist * 0.08);
+    vec3 waterFogColor = vec3(0.003, 0.03, 0.07) * nightDim;
+    return mix(absorbedColor, waterFogColor, fogFactor);
+}
 
 #define SEA_HEIGHT 0.65
 #define SEA_CHOPPY 7.5
@@ -172,7 +183,7 @@ vec3 apply_terrain_fog(vec3 color, vec3 viewPos) {
 #define SEA_FREQ 0.25
 
 float noise(vec2 p) {
-    return texture2D(noisetex, p * 0.00390625).r * 2.0 - 1.0;
+    return texture(noisetex, p * 0.00390625).r * 2.0 - 1.0;
 }
 
 float sea_octave_micro(vec2 uv, float choppy) {
@@ -220,40 +231,89 @@ vec3 get_water_normal(vec3 wwpos, float lod) {
     return normalize(vec3(slope.x * bumpStrength, 1.0, slope.y * bumpStrength));
 }
 
+// -------------------- 水面 POM 视差射线步进函数 --------------------
+vec3 raymarch_water_pom(vec3 origWorldPos, vec3 worldRayDir, float lod) {
+    vec3 rayDir = worldRayDir;
+    if (rayDir.y > -0.001) rayDir.y = -0.001;
+
+    float stepScale = 0.05;
+    vec3 p = origWorldPos;
+    vec3 stepVec = rayDir * (stepScale / abs(rayDir.y));
+    
+    vec3 prevP = p;
+    float prevH = p.y - (origWorldPos.y + getwave2(p, lod));
+    
+    for (int i = 0; i < 12; i++) {
+        p += stepVec;
+        float waveH = getwave2(p, lod);
+        float currH = p.y - (origWorldPos.y + waveH);
+        
+        if (currH < 0.0) {
+            float t = prevH / (prevH - currH);
+            p = mix(prevP, p, clamp(t, 0.0, 1.0));
+            break;
+        }
+        prevP = p;
+        prevH = currH;
+    }
+    return p;
+}
+
+// SSR 射线追踪 (已优化：延后边缘衰减计算)
 vec4 ray_trace_ssr(vec3 direction, vec3 start, float dither) {
     float rayLength = length(start);
-    vec3 testPoint = start + direction * (0.05 + 0.02 * dither);
+    vec3 testPoint = start + direction * (0.08 + 0.015 * dither);
     
-    float stepLen = 0.08 + rayLength * 0.005;
+    float stepLen = 0.08 + rayLength * 0.006;
     vec2 invProjDiag = vec2(gbufferProjectionInverse[0][0], gbufferProjectionInverse[1][1]);
 
-    for (int i = 0; i < 28; i++) {
+    for (int i = 0; i < 48; i++) {
         testPoint += direction * stepLen;
         if (testPoint.z >= -0.1) break;
 
         vec2 uv = (testPoint.xy / (-testPoint.z * invProjDiag)) * 0.5 + 0.5;
-        
-        vec2 edge = smoothstep(vec2(0.0), vec2(0.04), uv) * smoothstep(vec2(1.0), vec2(0.96), uv);
-        float edgeAlpha = edge.x * edge.y;
-        if (edgeAlpha <= 0.001) break;
+        if (uv.x <= 0.001 || uv.x >= 0.999 || uv.y <= 0.001 || uv.y >= 0.999) break;
 
-        float rawDepth0 = texture2D(depthtex0, uv).r;
+        float rawDepth0 = texture(depthtex0, uv).r;
         if (rawDepth0 < 0.9999) {
             vec3 sv = ScreenToView(uv, rawDepth0);
             float diff = sv.z - testPoint.z;
 
-            float maxThickness = stepLen * 1.5 + 0.10;
-            if (diff > -0.05 && diff < maxThickness) {
-                float rawDepth1 = texture2D(depthtex1, uv).r;
-                if (abs(rawDepth1 - rawDepth0) < 0.001) {
-                    vec3 hitColor = max(vec3(0.0), texture2D(colortex0, uv).rgb);
-                    hitColor = apply_terrain_fog(hitColor, sv);
+            float maxThickness = stepLen * 2.0 + 0.12;
+            if (diff > -0.08 && diff < maxThickness) {
 
-                    float depthWeight = smoothstep(maxThickness, 0.0, max(0.0, diff));
-                    return vec4(hitColor, edgeAlpha * depthWeight);
+                // ==================== 二分查找精细化 (Binary Search) ====================
+                vec3 minPoint = testPoint - direction * stepLen;
+                vec3 maxPoint = testPoint;
+                vec3 hitPoint = testPoint;
+
+                for (int j = 0; j < 5; j++) {
+                    hitPoint = mix(minPoint, maxPoint, 0.5);
+                    vec2 hitUV = (hitPoint.xy / (-hitPoint.z * invProjDiag)) * 0.5 + 0.5;
+                    float hitDepth = texture(depthtex0, hitUV).r;
+                    vec3 hitSv = ScreenToView(hitUV, hitDepth);
+
+                    if (hitSv.z > hitPoint.z) {
+                        maxPoint = hitPoint; // 穿透了深度，向后退
+                    } else {
+                        minPoint = hitPoint; // 未命中，向前进
+                    }
                 }
+
+                vec2 finalUV = (hitPoint.xy / (-hitPoint.z * invProjDiag)) * 0.5 + 0.5;
+                vec3 finalSv = ScreenToView(finalUV, texture(depthtex0, finalUV).r);
+                // =======================================================================
+
+                vec2 edge = smoothstep(vec2(0.0), vec2(0.04), finalUV) * smoothstep(vec2(1.0), vec2(0.96), finalUV);
+                float edgeAlpha = edge.x * edge.y;
+
+                vec3 hitColor = max(vec3(0.0), texture(colortex0, finalUV).rgb);
+                hitColor = apply_terrain_fog(hitColor, finalSv);
+
+                float depthWeight = smoothstep(maxThickness, 0.0, max(0.0, abs(finalSv.z - hitPoint.z)));
+                return vec4(hitColor, edgeAlpha * depthWeight);
             }
-            stepLen *= 1.05;
+            stepLen *= 1.06;
         } else {
             stepLen *= 1.10;
         }
@@ -272,13 +332,13 @@ vec3 ray_trace_ssgi(vec3 startViewPos, vec3 rayDir, vec3 surfaceNormal, vec2 inv
         vec2 sampleUV = (testPoint.xy / (-testPoint.z * invProjDiag)) * 0.5 + 0.5;
         if (sampleUV.x <= 0.005 || sampleUV.x >= 0.995 || sampleUV.y <= 0.005 || sampleUV.y >= 0.995) break;
 
-        float rawDepth = texture2D(depthtex0, sampleUV).r;
+        float rawDepth = texture(depthtex0, sampleUV).r;
         if (rawDepth < 0.9999) {
             vec3 sampleViewPos = ScreenToView(sampleUV, rawDepth);
             float diff = sampleViewPos.z - testPoint.z;
 
             if (diff > -0.05 && diff < (stepLen * 1.2 + 0.12)) {
-                vec2 sampleEncN = texture2D(colortex1, sampleUV).rg;
+                vec2 sampleEncN = texture(colortex1, sampleUV).rg;
                 vec2 sn2 = sampleEncN * 2.0 - 1.0;
                 float snz = sqrt(max(0.0, 1.0 - dot(sn2, sn2)));
                 vec3 sampleNormal = normalize(vec3(sn2, snz));
@@ -287,7 +347,7 @@ vec3 ray_trace_ssgi(vec3 startViewPos, vec3 rayDir, vec3 surfaceNormal, vec2 inv
                 float dist = length(sampleViewPos - startViewPos);
                 float distFade = max(0.0, 1.0 - (dist / SSGI_RADIUS));
 
-                vec3 hitColor = max(vec3(0.0), texture2D(colortex0, sampleUV).rgb);
+                vec3 hitColor = max(vec3(0.0), texture(colortex0, sampleUV).rgb);
                 vec2 edge = smoothstep(vec2(0.0), vec2(0.08), sampleUV) * smoothstep(vec2(1.0), vec2(0.92), sampleUV);
                 
                 return hitColor * edge.x * edge.y * normalWeight * distFade * SSGI_BOUNCE_BOOST;
@@ -298,11 +358,147 @@ vec3 ray_trace_ssgi(vec3 startViewPos, vec3 rayDir, vec3 surfaceNormal, vec2 inv
     return vec3(0.0);
 }
 
+// ==================== 2D 云层函数====================
+// 云参数
+const float cloudscale = 0.8;
+const float speed = 0.03;
+const float clouddark = 0.5;
+const float cloudlight = 0.3;
+const float cloudcover = 0.2;
+const float cloudalpha = 5.0;
+const float skytint = 0.5;
+const vec3 skycolour1 = vec3(0.2, 0.4, 0.6);
+const vec3 skycolour2 = vec3(0.4, 0.7, 1.0);
+
+const mat2 cloudM = mat2( 1.6,  1.2, -1.2,  1.6 );
+
+vec2 cloudHash( vec2 p ) {
+    p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)));
+    return -1.0 + 2.0*fract(sin(p)*43758.5453123);
+}
+
+float cloudNoise( in vec2 p ) {
+    const float K1 = 0.366025404;
+    const float K2 = 0.211324865;
+    vec2 i = floor(p + (p.x+p.y)*K1);	
+    vec2 a = p - i + (i.x+i.y)*K2;
+    vec2 o = (a.x>a.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+    vec2 b = a - o + K2;
+    vec2 c = a - 1.0 + 2.0*K2;
+    vec3 h = max(0.5-vec3(dot(a,a), dot(b,b), dot(c,c) ), 0.0 );
+    vec3 n = h*h*h*h*vec3( dot(a,cloudHash(i+0.0)), dot(b,cloudHash(i+o)), dot(c,cloudHash(i+1.0)));
+    return dot(n, vec3(70.0));	
+}
+
+float cloudFbm(vec2 n) {
+    float total = 0.0, amplitude = 0.1;
+    for (int i = 0; i < 7; i++) {
+        total += cloudNoise(n) * amplitude;
+        n = cloudM * n;
+        amplitude *= 0.4;
+    }
+    return total;
+}
+
+/*vec4 getCloud2D(vec2 pos, float time) {
+    float q = cloudFbm(pos * cloudscale * 0.5);
+    
+    float r = 0.0;
+    vec2 uv2 = pos * cloudscale;
+    uv2 -= q - time * speed;
+    float weight = 0.8;
+    for (int i=0; i<8; i++){
+        r += abs(weight*cloudNoise( uv2 ));
+        uv2 = cloudM*uv2 + time * speed;
+        weight *= 0.7;
+    }
+    
+    float f = 0.0;
+    uv2 = pos * cloudscale;
+    uv2 -= q - time * speed;
+    weight = 0.7;
+    for (int i=0; i<8; i++){
+        f += weight*cloudNoise( uv2 );
+        uv2 = cloudM*uv2 + time * speed;
+        weight *= 0.6;
+    }
+    
+    f *= r + f;
+    
+    float c = 0.0;
+    float time2 = time * speed * 2.0;
+    uv2 = pos * cloudscale * 2.0;
+    uv2 -= q - time2;
+    weight = 0.4;
+    for (int i=0; i<7; i++){
+        c += weight*cloudNoise( uv2 );
+        uv2 = cloudM*uv2 + time2;
+        weight *= 0.6;
+    }
+    
+    float c1 = 0.0;
+    float time3 = time * speed * 3.0;
+    uv2 = pos * cloudscale * 3.0;
+    uv2 -= q - time3;
+    weight = 0.4;
+    for (int i=0; i<7; i++){
+        c1 += abs(weight*cloudNoise( uv2 ));
+        uv2 = cloudM*uv2 + time3;
+        weight *= 0.6;
+    }
+    
+    c += c1;
+    
+    // 渐变改由 0~1 的高度比重驱动
+    vec3 skycolour = mix(skycolour2, skycolour1, 0.5);
+    vec3 cloudcolour = vec3(1.1, 1.1, 0.9) * clamp((clouddark + cloudlight*c), 0.0, 1.0);
+   
+    f = cloudcover + cloudalpha * f * r;
+    
+    float alpha = clamp(f + c, 0.0, 1.0);
+    vec3 col = mix(skycolour, clamp(skytint * skycolour + cloudcolour, 0.0, 1.0), alpha);
+    
+    return vec4(col, alpha);
+}*/
+
+float getCloudDensity(vec2 pos, float time) {
+    float q = cloudFbm(pos * cloudscale * 0.5);
+    vec2 uv2 = pos * cloudscale - (q - time * speed);
+    
+    float r = 0.0, weight = 0.8;
+    for (int i = 0; i < 5; i++) {
+        r += abs(weight * cloudNoise(uv2));
+        uv2 = cloudM * uv2 + time * speed;
+        weight *= 0.7;
+    }
+    
+    uv2 = pos * cloudscale - (q - time * speed);
+    float f = 0.0; weight = 0.7;
+    for (int i = 0; i < 5; i++) {
+        f += weight * cloudNoise(uv2);
+        uv2 = cloudM * uv2 + time * speed;
+        weight *= 0.6;
+    }
+    
+    float rawNoise = f * (r + f);
+
+    // 【核心修改】用 smoothstep 强行切掉低密度边缘，只保留云核
+    // 0.22 为起裁门槛（低于此值的云直接清零），0.55 为饱满点
+    float density = smoothstep(0.22, 0.55, rawNoise);
+
+    return density;
+}
+// =====================================================================
+
+layout(location = 0) out vec4 fragData0;
+layout(location = 1) out vec4 fragData1;
+layout(location = 2) out vec4 fragData2;
+
 void main() {
     vec2 uv = texCoord;
-    float waterDepth  = texture2D(depthtex0, uv).r; 
-    float seabedDepth = texture2D(depthtex1, uv).r; 
-    vec3 hdr = texture2D(colortex0, uv).rgb;
+    float waterDepth  = texture(depthtex0, uv).r; 
+    float seabedDepth = texture(depthtex1, uv).r; 
+    vec3 hdr = texture(colortex0, uv).rgb;
 
     float ssrDither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
 
@@ -320,7 +516,7 @@ void main() {
     float mainLightVis    = isDay ? saturate(realSunDir.y * 3.0) : saturate(-realSunDir.y * 3.0);
     float mainLightPower  = isDay ? 80.0 : 18.0;
 
-    bool isWater = (seabedDepth - waterDepth > 0.00005) && (waterDepth < 0.9999);
+    bool isWater = (seabedDepth - waterDepth > 0.000001) && (waterDepth < 0.9999);
     bool underwater = (isEyeInWater == 1);
 
     if (isWater) {
@@ -331,8 +527,13 @@ void main() {
         float viewDist = length(waterViewPos);
         float waveLod = clamp(1.0 - viewDist * 0.005, 0.15, 1.0);
 
+        vec3 rawWaterWorldPos = (gbufferModelViewInverse * vec4(waterViewPos, 1.0)).xyz + cameraPosition;
+        vec3 worldViewDir = normalize((gbufferModelViewInverse * vec4(waterViewDir, 0.0)).xyz);
+
+        vec3 waterWorldPos = underwater ? rawWaterWorldPos : raymarch_water_pom(rawWaterWorldPos, worldViewDir, waveLod);
+        waterViewPos = (gbufferModelView * vec4(waterWorldPos - cameraPosition, 1.0)).xyz;
+
         float waterThickness = max(0.0, abs(seabedViewPos.z - waterViewPos.z));
-        vec3 waterWorldPos = (gbufferModelViewInverse * vec4(waterViewPos, 1.0)).xyz + cameraPosition;
 
         vec3 flatWorldNormal = underwater ? vec3(0.0, -1.0, 0.0) : vec3(0.0, 1.0, 0.0);
         vec3 flatViewNormal  = normalize(mat3(gbufferModelView) * flatWorldNormal);
@@ -386,14 +587,15 @@ void main() {
 
         vec2 refractOffset = waterNormal.xy * 0.02 * clamp(waterThickness, 0.0, 1.5);
         vec2 refractUV = clamp(uv + refractOffset, vec2(0.001), vec2(0.999));
-        if (texture2D(depthtex1, refractUV).r <= waterDepth) refractUV = uv;
-        vec3 refractionColor = texture2D(colortex0, refractUV).rgb;
+        if (texture(depthtex1, refractUV).r <= waterDepth) refractUV = uv;
+        vec3 refractionColor = texture(colortex0, refractUV).rgb;
 
         float NdotV = max(0.0, dot(waterNormal, -waterViewDir));
         float fresnel = clamp(0.02 + 0.98 * pow(max(1.0 - NdotV, 0.0), 5.0), 0.02, 0.82);
 
         if (underwater) {
             hdr = mix(refractionColor, reflection, fresnel);
+            hdr = apply_underwater_fog(hdr, waterViewPos, nightDim);
         } else {
             vec3 absorb = exp(vec3(-0.65, -0.25, -0.10) * waterThickness);
             vec3 waterColor = refractionColor * absorb;
@@ -418,18 +620,18 @@ void main() {
         }
     }
 
-// SSGI 计算
-vec3 accumulatedSSGI = vec3(0.0);
+    vec3 accumulatedSSGI = vec3(0.0);
 
-#if SSGI_ENABLED == 1
+    // Terrain 渲染逻辑
     if (waterDepth < 0.9999 && !isWater) {
         vec3 viewPos = ScreenToView(uv, waterDepth);
         
-        vec2 encodedN = texture2D(colortex1, uv).rg;
+        vec2 encodedN = texture(colortex1, uv).rg;
         vec2 n2 = encodedN * 2.0 - 1.0;
         float nz = sqrt(max(0.0, 1.0 - dot(n2, n2)));
         vec3 viewNormal = normalize(vec3(n2, nz));
 
+    #if SSGI_ENABLED == 1
         vec3 tangent = normalize(abs(viewNormal.z) < 0.999 ? cross(vec3(0.0, 0.0, 1.0), viewNormal) : cross(vec3(1.0, 0.0, 0.0), viewNormal));
         vec3 bitangent = cross(viewNormal, tangent);
         mat3 tbn = mat3(tangent, bitangent, viewNormal);
@@ -469,7 +671,7 @@ vec3 accumulatedSSGI = vec3(0.0);
 
         accumulatedSSGI = rawSSGI;
         if (prevUV.x > 0.001 && prevUV.x < 0.999 && prevUV.y > 0.001 && prevUV.y < 0.999) {
-            vec3 historySSGI = texture2D(colortex8, prevUV).rgb;
+            vec3 historySSGI = texture(colortex8, prevUV).rgb;
 
             vec3 minAllowed = mean - 1.2 * sigma;
             vec3 maxAllowed = mean + 2.0 * sigma + vec3(0.01);
@@ -487,38 +689,23 @@ vec3 accumulatedSSGI = vec3(0.0);
             accumulatedSSGI = rawSSGI;
         }
         hdr += accumulatedSSGI * SSGI_STRENGTH;
-    }
-#endif
+    #endif
 
-    if (waterDepth < 0.9999 && !isWater) {
-        vec3 terrainViewPos = ScreenToView(uv, waterDepth);
-        hdr = apply_terrain_fog(hdr, terrainViewPos);
-    }
+        hdr = apply_terrain_fog(hdr, viewPos);
 
-    // =================【全地面湿润效果（已修正洞穴盲反射问题）】=================
-    if (waterDepth < 0.9999 && !isWater) {
-        float skyLight = texture2D(colortex1, uv).a;
-
-        vec2 encodedN = texture2D(colortex1, uv).rg;
-        vec2 n2 = encodedN * 2.0 - 1.0;
-        float nz = sqrt(max(0.0, 1.0 - dot(n2, n2)));
-        vec3 viewNormal = normalize(vec3(n2, nz));
+        // 全地面湿润效果
+        float skyLight = texture(colortex1, uv).a;
         vec3 worldNormal = normalize((gbufferModelViewInverse * vec4(viewNormal, 0.0)).xyz);
         
         float isFloor = smoothstep(0.30, 0.70, worldNormal.y);
-        
-        // 【修正 1】：提高天空光判断门槛（0.85 ~ 0.98），确保洞穴深处接收到的微弱散射天空光不会被误判为露天
         float skyLightFactor = smoothstep(0.85, 0.98, skyLight);
         float wetness = clamp(rainStrength, 0.0, 1.0) * skyLightFactor * isFloor;
 
         if (wetness > 0.01) {
-            vec3 viewPos = ScreenToView(uv, waterDepth);
             vec3 viewDir = normalize(viewPos);
 
-            // 地面暗化程度调柔和（0.88），防止过度变黑
             hdr *= mix(1.0, 0.88, wetness);
 
-            // 使用稳定起点，避免 NdotV 导致的极化拉扯
             float NdotV = max(0.0, dot(viewNormal, -viewDir));
             vec3 startPos = viewPos + viewNormal * (0.06 + 0.02 * length(viewPos));
 
@@ -530,7 +717,6 @@ vec3 accumulatedSSGI = vec3(0.0);
 
             vec3 skyRefl = AtmosphericScattering(reflectWorldDir, realSunDir, 0.8);
             
-            // 【修正 2】：回退环境天光相乘 skyLightFactor 遮罩，即便 SSR 追踪失败，在无光/半闭合空间内也会衰减为 0，不再亮如白昼
             vec3 rainSkyAmbient = mix(vec3(0.35, 0.40, 0.48), skyRefl, 0.6) * 0.85 * skyLightFactor; 
             vec3 wetReflection = mix(rainSkyAmbient, ssr.rgb, ssr.a);
 
@@ -540,22 +726,20 @@ vec3 accumulatedSSGI = vec3(0.0);
             hdr = mix(hdr, wetReflection, reflectFactor);
         }
     }
-    // =====================================================================
-    // =====================================================================
 
-    vec3 rawBloom = texture2D(colortex3, uv).rgb + texture2D(colortex4, uv).rgb;
+    vec3 rawBloom = texture(colortex3, uv).rgb + texture(colortex4, uv).rgb;
     vec3 bloom = mix(rawBloom, rawBloom * sunColor, 0.10);
     hdr += bloom * BLOOM_STRENGTH; 
 
     float rawLum = 0.0;
-    rawLum += texture2D(colortex6, vec2(0.50, 0.50)).r * 0.40;
-    rawLum += texture2D(colortex6, vec2(0.46, 0.46)).r * 0.15;
-    rawLum += texture2D(colortex6, vec2(0.54, 0.54)).r * 0.15;
-    rawLum += texture2D(colortex6, vec2(0.46, 0.54)).r * 0.15;
-    rawLum += texture2D(colortex6, vec2(0.54, 0.46)).r * 0.15;
+    rawLum += texture(colortex6, vec2(0.50, 0.50)).r * 0.40;
+    rawLum += texture(colortex6, vec2(0.46, 0.46)).r * 0.15;
+    rawLum += texture(colortex6, vec2(0.54, 0.54)).r * 0.15;
+    rawLum += texture(colortex6, vec2(0.46, 0.54)).r * 0.15;
+    rawLum += texture(colortex6, vec2(0.54, 0.46)).r * 0.15;
     rawLum = max(rawLum, 0.0001);
 
-    float prevLum = texture2D(colortex7, vec2(0.5)).r;
+    float prevLum = texture(colortex7, vec2(0.5)).r;
     if (prevLum < 0.001) prevLum = rawLum;
     float smoothLum = prevLum + (rawLum - prevLum) * (1.0 - exp(-frametime * 3.0));
     float nightFactor = clamp(1.0 - smoothLum * 3.0, 0.0, 1.0);
@@ -574,6 +758,52 @@ vec3 accumulatedSSGI = vec3(0.0);
     vec3 skyHDR = (realSunDir.y > -0.05) ? 
         AtmosphericScattering(worldDir, realSunDir, 1.0) * mix(1.0, 0.35, saturate(rainStrength)) : 
         AtmosphericScattering(worldDir, -realSunDir, 0.1) * 0.02 + vec3(0.001, 0.005, 0.018);
+
+    // ==================== 叠加 2D 云层 (通透高亮版) ====================
+    if (CLOUD2D_ENABLED && waterDepth > 0.999 && worldDir.y > 0.0) {
+        float cloudTime = frameTimeCounter * 0.1;
+        vec2 skyPlaneUV = worldDir.xz / (worldDir.y + 0.18);
+
+        // 1. 采样中心密度
+        float density = getCloudDensity(skyPlaneUV, cloudTime);
+
+        if (density > 0.01) {
+            // 2. 伪自阴影采样 (提亮阴影底限，消除乌云感)
+            vec2 sunOffset = normalize(realSunDir.xz + vec2(0.0001)) * 0.12;
+            float shadowDensity = getCloudDensity(skyPlaneUV - sunOffset, cloudTime);
+            
+            float lightDiff = clamp(density - shadowDensity, 0.0, 1.0);
+            // 最低阴影系数由 0.45 提至 0.68，保证云底依然明亮
+            float shadowFactor = mix(0.68, 1.0, clamp(1.0 - (shadowDensity - density) * 2.0, 0.0, 1.0));
+
+            // 3. 天空底色：适度提亮大气环境光提感
+            vec3 cloudBaseColor = skyHDR * shadowFactor * 1.15;
+
+            // 4. 核心：阳光穿透感 (Beer's Law 光透射模拟)
+            float cosTheta = max(0.0, dot(worldDir, realSunDir));
+            float sunFactor = saturate(sunHeight * 3.0) * (1.0 - rainStrength);
+
+            // 云越薄透光越强；朝太阳方向看时，阳光会透射出通透的高光
+            float transmittance = exp(-density * 1.6); 
+            vec3 lightTransmit = sunColor * transmittance * (1.2 + 3.5 * pow(cosTheta, 4.0)) * sunFactor;
+
+            // 5. 增强边缘银边与辉光 (Silver Lining & Specular Glow)
+            float silverLining = pow(cosTheta, 6.0) * (1.0 - density * 0.8) * sunFactor;
+            vec3 specularGlow = sunColor * silverLining * 6.0;
+
+            // 6. 受光面与透光叠加
+            vec3 directSun = sunColor * (0.8 + 2.5 * lightDiff) * sunFactor;
+            cloudBaseColor += directSun * density * 0.4 + lightTransmit + specularGlow;
+
+            // 7. 透明度控制：降低 Alpha 上限 (0.85 -> 0.65)，让更多天空底色透出来
+            float horizonFade = smoothstep(0.02, 0.22, worldDir.y);
+            float finalAlpha = density * 0.65 * horizonFade;
+
+            // 8. 混合输出
+            skyHDR = mix(skyHDR, cloudBaseColor, finalAlpha);
+        }
+    }
+    // ====================================================================
 
     float horizonFactor = saturate(sunHeight * 3.0);
     float sd = dot(worldDir, realSunDir);
@@ -598,7 +828,7 @@ vec3 accumulatedSSGI = vec3(0.0);
     result = mix(vec3(lum), result, SATURATION);
     result += fract(sin(dot(texCoord, vec2(12.9898, 78.233))) * 43758.5453) / 255.0;
 
-    gl_FragData[0] = vec4(result, 1.0);
-    gl_FragData[1] = vec4(vec3(smoothLum), 1.0);
-    gl_FragData[2] = vec4(accumulatedSSGI, 1.0);
+    fragData0 = vec4(result, 1.0);
+    fragData1 = vec4(vec3(smoothLum), 1.0);
+    fragData2 = vec4(accumulatedSSGI, 1.0);
 }

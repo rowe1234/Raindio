@@ -1,4 +1,4 @@
-#version 120
+#version 330 compatibility
 /* DRAWBUFFERS:01 */
 
 #define PI 3.14159265359
@@ -7,41 +7,41 @@
 #define EMISSIVE_BRIGHTNESS 1.2
 // ========================================================
 
-varying vec3 vNormal;
-varying vec4 vColor;
-varying vec4 vTexCoord;
-varying vec3 vEyePos;
-varying vec2 vLightmap;
-varying float vBlockId;
+in vec3 vNormal;
+in vec4 vColor;
+in vec4 vTexCoord;
+in vec3 vEyePos;
+in vec2 vLightmap;
+in float vBlockId;
 
-varying float vEmissive;
-
-varying vec3 vSkyColor;
-varying vec3 vSunlight;
-varying float vDayFactor;
-varying float vSunIntensity;
+in vec3 vSkyColor;
+in vec3 vSunlight;
+in vec4 vParams; // x: vDayFactor, y: vSunIntensity, z: vEmissive
 
 uniform sampler2D texture;
 uniform sampler2D lightmap;
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
 uniform sampler2D shadowtex0;
-uniform mat4 shadowProjection;
-uniform mat4 shadowModelView;
 uniform mat4 gbufferModelView;
 uniform sampler2D specular;
+
+// 补充阴影计算所需 Uniform
+uniform mat4 shadowProjection;
+uniform mat4 shadowModelView;
 
 // =================【雨天湿地 Uniform】=================
 uniform float rainStrength;
 uniform float frameTimeCounter;
 uniform vec3 cameraPosition;
 
+// 适配 4096 贴图大小的 PCSS 参数
 const float SHADOW_RES = 4096.0;
-const float LIGHT_SIZE = 0.8;     
-const float MAX_PENUMBRA = 8.0;   
-const float MIN_PENUMBRA = 0.8;   
+const float LIGHT_SIZE = 1.2;     // 光源尺寸（控制半影扩散速度）
+const float MAX_PENUMBRA = 28.0;  // 最大半影扩散半径（纹素）
+const float MIN_PENUMBRA = 12.0;  // 最小滤波半径（防止接触面硬边锯齿）
 
-const vec2 poissonDisk[16] = vec2[](
+const vec2 poissonDisk[16] = vec2[16](
     vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
     vec2(-0.094184101, -0.92938870), vec2(0.34495938, 0.29387760),
     vec2(-0.91588581, 0.45771432),  vec2(-0.81544232, -0.87912464),
@@ -65,18 +65,25 @@ float interleavedGradientNoise() {
     return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 }
 
-float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewToShadow) {
+float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin) {
     float NdotL_eff = isThin ? abs(NdotL) : NdotL;
     if (NdotL_eff <= 0.001) return 0.0;
 
-    float normalBiasFactor = isThin ? 0.012 : 0.022;
+    // 直接在片元内部组合阴影变换矩阵
+    mat4 viewToShadow = shadowProjection * shadowModelView * gbufferModelViewInverse;
+
+    float normalBiasFactor = isThin ? 0.015 : 0.035;
     vec3 biasedEyePos = eyePos + N * (normalBiasFactor * (1.0 - clamp(NdotL_eff, 0.0, 1.0)));
 
     vec4 shadowClip = viewToShadow * vec4(biasedEyePos, 1.0);
     vec3 shadowNDC = shadowClip.xyz / shadowClip.w;
 
-    float distortFactor = length(shadowNDC.xy) * 0.8 + 0.2;
-    shadowNDC.xy /= distortFactor;
+    float l = length(shadowNDC.xy);
+    float distortFactor = 1.0;
+    if (l > 0.00001) {
+        distortFactor = l * 0.8 + 0.2;
+        shadowNDC.xy /= distortFactor;
+    }
 
     vec3 shadowCoord = shadowNDC * 0.5 + 0.5;
 
@@ -87,16 +94,20 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     }
 
     float slope = sqrt(clamp(1.0 - NdotL_eff * NdotL_eff, 0.0, 1.0));
-    float receiverDepth = shadowCoord.z - (0.00006 + 0.00012 * slope) / distortFactor;
+    float baseBias = 0.00015 + 0.00035 * slope;
+    float receiverDepth = shadowCoord.z - baseBias;
 
     const float oneTexel = 1.0 / SHADOW_RES;
-    float searchRadius = (LIGHT_SIZE * oneTexel) / distortFactor;
+
+    float searchRadius = LIGHT_SIZE * 12.0 * oneTexel * distortFactor;
     
     int blockerCount = 0;
     float blockerDepthSum = 0.0;
-    for (int i = 0; i < 12; i++) {
-        float sampleDepth = texture2D(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius).r;
-        if (sampleDepth < receiverDepth) {
+    float blockerBias = baseBias * 1.2;
+
+    for (int i = 0; i < 16; i++) {
+        float sampleDepth = textureLod(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius, 0.0).r;
+        if (sampleDepth < shadowCoord.z - blockerBias) {
             blockerCount++;
             blockerDepthSum += sampleDepth;
         }
@@ -105,22 +116,29 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     if (blockerCount == 0) return 1.0;
 
     float avgBlockerDepth = blockerDepthSum / float(blockerCount);
-    float penumbra = (receiverDepth - avgBlockerDepth) / max(avgBlockerDepth, 0.00001);
-    float filterRadius = clamp(penumbra * LIGHT_SIZE * 25.0, MIN_PENUMBRA, MAX_PENUMBRA);
+    float dDiff = max(shadowCoord.z - avgBlockerDepth, 0.0);
+    
+    float penumbra = dDiff * 600.0;
+    float filterRadius = clamp(penumbra * LIGHT_SIZE * 8.0 + MIN_PENUMBRA, MIN_PENUMBRA, MAX_PENUMBRA);
+    filterRadius *= distortFactor;
 
     float randomAngle = interleavedGradientNoise() * 6.2831853;
     mat2 rotationMatrix = mat2(cos(randomAngle), sin(randomAngle), -sin(randomAngle), cos(randomAngle));
 
     float shadowSum = 0.0;
-    float stepScale = (filterRadius * oneTexel) / distortFactor;
+    float stepScale = filterRadius * oneTexel;
     mat2 scaledRot = rotationMatrix * stepScale;
 
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 16; i++) {
         vec2 sampleUV = shadowCoord.st + scaledRot * poissonDisk[i];
-        shadowSum += (receiverDepth > texture2D(shadowtex0, sampleUV).r) ? 0.0 : 1.0;
+        shadowSum += (receiverDepth > textureLod(shadowtex0, sampleUV, 0.0).r) ? 0.0 : 1.0;
     }
 
-    float shadow = shadowSum * 0.0833333;
+    float shadow = shadowSum * 0.0625;
+
+    float blockerWeight = smoothstep(0.0, 2.0, float(blockerCount));
+    shadow = mix(1.0, shadow, blockerWeight);
+
     vec2 edgeDist = abs(shadowCoord.st - 0.5) * 2.0;
     float fade = 1.0 - smoothstep(0.85, 0.98, max(edgeDist.x, edgeDist.y));
     return mix(1.0, shadow, fade);
@@ -160,8 +178,16 @@ void getDefaultMetalnessRoughness(float blockId, out float metalness, out float 
     else if (blockId == 2.0) roughness = 0.65;
 }
 
+layout(location = 0) out vec4 fragData0;
+layout(location = 1) out vec4 fragData1;
+
 void main() {
-    vec4 albedo = texture2D(texture, vTexCoord.st) * vColor;
+    float vDayFactor = vParams.x;
+    float vSunIntensity = vParams.y;
+    float vEmissive = vParams.z;
+
+    vec4 texColor = texture(texture, vTexCoord.st);
+    vec4 albedo = vec4(texColor.rgb * vColor.rgb, texColor.a);
     if (albedo.a < 0.1) discard;
 
     bool isThin = (albedo.a < 0.99) || 
@@ -170,7 +196,7 @@ void main() {
                   (vBlockId >= 188.0 && vBlockId <= 192.0) || 
                   vBlockId == 6.0 || vBlockId == 59.0 || vBlockId == 175.0;
 
-    vec4 specMap = texture2D(specular, vTexCoord.st);
+    vec4 specMap = texture(specular, vTexCoord.st);
     float defaultMetal, defaultRough;
     getDefaultMetalnessRoughness(vBlockId, defaultMetal, defaultRough);
 
@@ -181,23 +207,17 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 V = normalize(-vEyePos);
 
-    vec4 lm = texture2D(lightmap, vLightmap);
+    vec4 lm = texture(lightmap, vLightmap);
 
-    // =================【全地面统一湿润系统（无积水坑）】=================
     if (rainStrength > 0.001) {
         vec3 worldNormal = normalize((gbufferModelViewInverse * vec4(N, 0.0)).xyz);
-        
         float skyExposure = smoothstep(0.4, 0.85, lm.y);
-        float upFactor = clamp(worldNormal.y * 0.7 + 0.3, 0.0, 1.0); // 顶面主打湿，立面微湿
+        float upFactor = clamp(worldNormal.y * 0.7 + 0.3, 0.0, 1.0);
         float totalWetness = saturate(rainStrength) * skyExposure * upFactor;
 
-        // 1. 全地面统一适度吸光变暗
         albedo.rgb *= mix(1.0, 0.65, totalWetness);
-
-        // 2. 全地面粗糙度统一降低（表现为整体湿润的高光/平滑水膜质感）
         roughness = mix(roughness, 0.12, totalWetness);
     }
-    // =====================================================================
 
     vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
     float sunHeight = worldSunDir.y;
@@ -212,14 +232,14 @@ void main() {
 
     float shadow = 1.0;
     float shadowStrength = smoothstep(-0.02, 0.15, sunHeight);
-    if (sunHeight > -0.01 && (NdotL_raw > 0.001 || isThin)) {
-        mat4 viewToShadow = shadowProjection * shadowModelView * gbufferModelViewInverse;
-        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, isThin, viewToShadow), shadowStrength);
+
+    if (sunHeight > -0.01 && shadowStrength > 0.001 && (NdotL_raw > 0.001 || isThin)) {
+        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, isThin), shadowStrength);
     }
 
     float skyAmbient = CurveBlockLightSky(lm.y);
     float skyDirect  = lm.y * lm.y;
-    float blockLight = pow(lm.x, 2.5);
+    float blockLight = lm.x * lm.x * sqrt(lm.x);
 
     vec3 directLightColor = mix(vSunlight, vSkyColor, 0.15 * (1.0 - vDayFactor));
     float rainSunFade = mix(1.0, 0.25, saturate(rainStrength));
@@ -257,7 +277,7 @@ void main() {
 
     float torchRange = 1.0 - blockLight;
     vec3 customLightColor = vec3(1.0, 0.4, 0.1); 
-    float torchRainBoost = mix(1.0, 1.8, saturate(rainStrength)); // 雨天方块光强度提升 80%
+    float torchRainBoost = mix(1.0, 1.8, saturate(rainStrength));
     vec3 torchLight = customLightColor * (blockLight * (1.0 + torchRange * 0.3) * 0.45 * torchRainBoost);
     
     float torchNdotL = max(dot(N, vec3(0.0, 0.8, 0.2)), 0.1);
@@ -268,15 +288,14 @@ void main() {
 
     vec3 color = ambient + directDiffuse + directSpecular + metalSunGradient + torchContribution + minLight;
 
-    // 2. 为发光方块（荧石/火把等）加入雨天动态增强倍率
     if (vEmissive > 0.0) {
         vec3 rawTexture = albedoColor;
-        float emissiveRainBoost = mix(1.0, 2.5, saturate(rainStrength)); // 雨天自发光强度提升至 2.5 倍
+        float emissiveRainBoost = mix(1.0, 2.5, saturate(rainStrength));
         vec3 glowingColor = rawTexture * (1.0 + vEmissive * EMISSIVE_BRIGHTNESS * emissiveRainBoost);
         color = mix(color, glowingColor, vEmissive);
     }
-    gl_FragData[0] = vec4(color, albedo.a);
+    fragData0 = vec4(color, albedo.a);
     float waterFlag = (vBlockId == 8.0 || vBlockId == 9.0 || vBlockId == 79.0) ? 0.79 : 1.0;
 
-    gl_FragData[1] = vec4(N.xy * 0.5 + 0.5, waterFlag, lm.y);
+    fragData1 = vec4(N.xy * 0.5 + 0.5, waterFlag, lm.y);
 }

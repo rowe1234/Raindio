@@ -1,8 +1,13 @@
-#version 120
+#version 410 core
 
-varying vec2 texCoord;
+in vec3 vaPosition;
+in vec2 vaUV0;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+
+out vec2 texCoord;
 
 void main() {
-    gl_Position = ftransform();
-    texCoord = gl_MultiTexCoord0.st;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(vaPosition, 1.0);
+    texCoord = vaUV0;
 }

@@ -1,52 +1,41 @@
-#version 120
+#version 330 compatibility
 
-varying vec3 vNormal;
-varying vec4 vColor;
-varying vec4 vTexCoord;
-varying vec3 vEyePos;
-varying vec2 vLightmap;
-varying float vBlockId;
+// 顶点输出变量
+out vec3 vNormal;
+out vec4 vColor;
+out vec4 vTexCoord;
+out vec3 vEyePos;
+out vec2 vLightmap;
+out float vBlockId;
 
-varying vec3 vSkyColor;
-varying vec3 vSunlight;
-varying float vDayFactor;
-varying float vSunIntensity;
+out vec3 vSkyColor;
+out vec3 vSunlight;
+out vec4 vParams; // 打包传输：x: vDayFactor, y: vSunIntensity, z: vEmissive
 
-// 传递自发光权重
-varying float vEmissive;
+// 替换 legacy attribute 为 330 标准 in 关键字
+in float mc_Entity;
 
-attribute float mc_Entity;
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
 
 void main() {
-    vTexCoord = gl_MultiTexCoord0;
+    // 使用 ftransform() 让 Iris / Sodium 自动完成顶点变换与区块偏移处理
+    gl_Position = ftransform();
+
+    vTexCoord = gl_TextureMatrix[0] * gl_MultiTexCoord0;
     vLightmap = (gl_TextureMatrix[1] * gl_MultiTexCoord1).xy;
     vColor = gl_Color;
     vBlockId = mc_Entity;
-
-    // =================【自发光权重下调】=================
-    vEmissive = 0.0;
-    if (mc_Entity == 10000.0) {
-        vEmissive = 0.7;   // 强发光方块（荧石、海晶灯等）
-        vLightmap.x = 1.0; 
-    } else if (mc_Entity == 10001.0) {
-        vEmissive = 0.35;  // 中亮度发光方块（火把、末地烛等）
-        vLightmap.x = max(vLightmap.x, 0.85);
-    } else {
-        // 兜底自发光
-        vEmissive = smoothstep(0.93, 0.98, vLightmap.x) * 0.3;
-    }
-    // ====================================================
 
     vec4 viewPos = gl_ModelViewMatrix * gl_Vertex;
     vEyePos = viewPos.xyz;
     vNormal = normalize(gl_NormalMatrix * gl_Normal);
 
+    // 昼夜与日光计算
     vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
     float sunHeight = worldSunDir.y;
 
-    vDayFactor = smoothstep(-0.05, 0.15, sunHeight);
+    float dayFactor = smoothstep(-0.05, 0.15, sunHeight);
     float noonFactor = smoothstep(0.00, 0.60, sunHeight);
 
     const vec3 skyNight  = vec3(0.002, 0.010, 0.040);
@@ -56,9 +45,21 @@ void main() {
     const vec3 sunSunset = vec3(0.90, 0.40, 0.08);
     const vec3 sunNoon   = vec3(1.00, 0.92, 0.75);
 
-    vSkyColor = mix(skyNight, mix(skySunset, skyNoon, noonFactor), vDayFactor);
-    vSunlight = (sunHeight > 0.0) ? mix(sunNight, mix(sunSunset, sunNoon, noonFactor), vDayFactor) : vec3(0.18, 0.25, 0.40);
-    vSunIntensity = (sunHeight > 0.0) ? 1.0 : 0.4;
+    vSkyColor = mix(skyNight, mix(skySunset, skyNoon, noonFactor), dayFactor);
+    vSunlight = (sunHeight > 0.0) ? mix(sunNight, mix(sunSunset, sunNoon, noonFactor), dayFactor) : vec3(0.18, 0.25, 0.40);
+    float sunIntensity = (sunHeight > 0.0) ? 1.0 : 0.4;
 
-    gl_Position = ftransform();
+    // 自定义方块发光逻辑
+    float emissive = 0.0;
+    if (mc_Entity == 10000.0) {
+        emissive = 0.7;
+        vLightmap.x = 1.0;
+    } else if (mc_Entity == 10001.0) {
+        emissive = 0.35;
+        vLightmap.x = max(vLightmap.x, 0.85);
+    } else {
+        emissive = smoothstep(0.93, 0.98, vLightmap.x) * 0.3;
+    }
+
+    vParams = vec4(dayFactor, sunIntensity, emissive, 0.0);
 }

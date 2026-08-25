@@ -1,27 +1,43 @@
-#version 120
+#version 410 core
 
-varying vec3 vNormal;
-varying vec4 vColor;
-varying vec4 vTexCoord;
-varying vec3 vEyePos;
-varying vec2 vLightmap;
+out vec3 vNormal;
+out vec4 vColor;
+out vec4 vTexCoord;
+out vec3 vEyePos;
+out vec2 vLightmap;
 
-varying vec3 vSkyColor;
-varying vec3 vSunlight;
-varying float vDayFactor;
-varying float vSunIntensity;
+out vec3 vSkyColor;
+out vec3 vSunlight;
+out float vDayFactor;
+out float vSunIntensity;
+
+in vec3 vaPosition;
+in vec4 vaColor;
+in vec2 vaUV0;
+in ivec2 vaUV2;
+in vec3 vaNormal;
 
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+uniform mat3 normalMatrix;
+
+const mat4 TEXTURE_MATRIX_2 = mat4(
+    vec4(0.00390625, 0.0, 0.0, 0.0),
+    vec4(0.0, 0.00390625, 0.0, 0.0),
+    vec4(0.0, 0.0, 0.00390625, 0.0),
+    vec4(0.03125, 0.03125, 0.03125, 1.0)
+);
 
 void main() {
-    vTexCoord = gl_MultiTexCoord0;
-    vLightmap = (gl_TextureMatrix[1] * gl_MultiTexCoord1).xy;
-    vColor = gl_Color;
+    vTexCoord = vec4(vaUV0, 0.0, 1.0);
+    vLightmap = (TEXTURE_MATRIX_2 * vec4(vec2(vaUV2), 0.0, 1.0)).xy;
+    vColor = vaColor;
 
-    vec4 viewPos = gl_ModelViewMatrix * gl_Vertex;
+    vec4 viewPos = modelViewMatrix * vec4(vaPosition, 1.0);
     vEyePos = viewPos.xyz;
-    vNormal = normalize(gl_NormalMatrix * gl_Normal);
+    vNormal = normalize(normalMatrix * vaNormal);
 
     vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
     float sunHeight = worldSunDir.y;
@@ -40,5 +56,5 @@ void main() {
     vSunlight = (sunHeight > 0.0) ? mix(sunNight, mix(sunSunset, sunNoon, noonFactor), vDayFactor) : vec3(0.15, 0.20, 0.35);
     vSunIntensity = (sunHeight > 0.0) ? 1.0 : 0.4;
 
-    gl_Position = ftransform();
+    gl_Position = projectionMatrix * viewPos;
 }

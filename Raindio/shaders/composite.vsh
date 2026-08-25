@@ -1,14 +1,19 @@
-#version 120
+#version 410 core
 
-varying vec2 texCoord;
-varying vec3 suncolor;  // 新增
+in vec3 vaPosition;
+in vec2 vaUV0;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+
+out vec2 texCoord;
+out vec3 suncolor;
 
 uniform vec3 sunPosition;
 uniform mat4 shadowModelViewInverse;
 
 void main() {
-    gl_Position = ftransform();
-    texCoord = gl_MultiTexCoord0.st;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(vaPosition, 1.0);
+    texCoord = vaUV0;
 
     // 计算太阳颜色（从 shadowModelViewInverse 获取世界空间太阳方向）
     vec3 worldSunDir = normalize((shadowModelViewInverse * vec4(0.0, 0.0, 1.0, 0.0)).xyz);
