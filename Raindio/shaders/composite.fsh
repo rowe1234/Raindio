@@ -1,6 +1,8 @@
 #version 410 core
 /* DRAWBUFFERS:034 */
 
+#include "/lib/common.glsl"
+
 in vec2 texCoord;
 
 uniform sampler2D colortex0;
@@ -33,14 +35,6 @@ const float GLARE_WEIGHTS[12] = float[12](
     1.000000, 0.860708, 0.740818, 0.637628, 0.548812, 0.472367,
     0.406570, 0.349938, 0.301194, 0.259240, 0.223130, 0.192050
 );
-
-float luminance(vec3 c) {
-    return dot(c, vec3(0.299, 0.587, 0.114));
-}
-
-float rand(vec2 co) {
-    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
 
 // 快速剪枝提取高光
 vec3 extractPureLight(vec3 color, float threshold) {

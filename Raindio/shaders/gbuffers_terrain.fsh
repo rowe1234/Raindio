@@ -1,7 +1,8 @@
 #version 330 compatibility
 /* DRAWBUFFERS:01 */
 
-#define PI 3.14159265359
+#include "/lib/common.glsl"
+#include "/lib/pbr.glsl"
 
 #define EMISSIVE_BRIGHTNESS 1.2
 #define PLANT_SSS_INTENSITY 0.22  
@@ -37,31 +38,7 @@ uniform vec3 cameraPosition;
 const float SHADOW_RES = 4096.0;
 const float LIGHT_SIZE = 1.2;     
 const float MAX_PENUMBRA = 28.0;  
-const float MIN_PENUMBRA = 12.0;  
-
-const vec2 poissonDisk[16] = vec2[16](
-    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
-    vec2(-0.094184101, -0.92938870), vec2(0.34495938, 0.29387760),
-    vec2(-0.91588581, 0.45771432),  vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277182, 0.27676845),  vec2(0.97484398, 0.75648379),
-    vec2(0.44323325, -0.97511554),  vec2(0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090160),
-    vec2(-0.24188840, 0.99706507),  vec2(-0.81409955, 0.91437590),
-    vec2(0.19984126, 0.78641367),   vec2(0.14383161, -0.14100790)
-);
-
-float saturate(float x) { return clamp(x, 0.0, 1.0); }
-
-float CurveBlockLightSky(float blockLight) {
-    float inv = 1.0 - blockLight;
-    float sq = inv * inv;
-    float res = 1.0 - sq * sqrt(inv);
-    return res * res * res;
-}
-
-float interleavedGradientNoise() {
-    return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-}
+const float MIN_PENUMBRA = 12.0;
 
 float getPCSSShadowHD(vec3 eyePos, vec3 N, vec3 L, float NdotL, bool isThin) {
     float NdotL_eff = isThin ? max(abs(NdotL), 0.1) : NdotL;
@@ -99,7 +76,7 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, vec3 L, float NdotL, bool isThin) {
     float blockerDepthSum = 0.0;
     float blockerBias = baseBias * 1.2;
 
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i <12; i++) {
         float sampleDepth = textureLod(shadowtex0, shadowCoord.st + poissonDisk[i] * searchRadius, 0.0).r;
         if (sampleDepth < shadowCoord.z - blockerBias) {
             blockerCount++;
@@ -116,14 +93,14 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, vec3 L, float NdotL, bool isThin) {
     float filterRadius = clamp(penumbra * LIGHT_SIZE * 8.0 + MIN_PENUMBRA, MIN_PENUMBRA, MAX_PENUMBRA);
     filterRadius *= distortFactor;
 
-    float randomAngle = isThin ? 0.0 : (interleavedGradientNoise() * 6.2831853);
+    float randomAngle = isThin ? 0.0 : (interleavedGradientNoise(gl_FragCoord.xy) * 6.2831853);
     mat2 rotationMatrix = mat2(cos(randomAngle), sin(randomAngle), -sin(randomAngle), cos(randomAngle));
 
     float shadowSum = 0.0;
     float stepScale = filterRadius * oneTexel;
     mat2 scaledRot = rotationMatrix * stepScale;
 
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 12; i++) {
         vec2 sampleUV = shadowCoord.st + scaledRot * poissonDisk[i];
         shadowSum += (receiverDepth > textureLod(shadowtex0, sampleUV, 0.0).r) ? 0.0 : 1.0;
     }
@@ -135,28 +112,6 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, vec3 L, float NdotL, bool isThin) {
     vec2 edgeDist = abs(shadowCoord.st - 0.5) * 2.0;
     float fade = 1.0 - smoothstep(0.85, 0.98, max(edgeDist.x, edgeDist.y));
     return mix(1.0, shadow, fade);
-}
-
-float GGX_D(float NdotH, float roughness) {
-    float a2 = roughness * roughness * roughness * roughness;
-    float NdotHSq = NdotH * NdotH;
-    float denom = NdotHSq * (a2 - 1.0) + 1.0;
-    return a2 / (PI * denom * denom);
-}
-
-float GGX_G1(float NdotV, float roughness) {
-    float k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
-    return NdotV / (NdotV * (1.0 - k) + k);
-}
-
-float GGX_G(float NdotL, float NdotV, float roughness) {
-    return GGX_G1(NdotL, roughness) * GGX_G1(NdotV, roughness);
-}
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    float m = 1.0 - cosTheta;
-    float m2 = m * m;
-    return F0 + (1.0 - F0) * (m2 * m2 * m);
 }
 
 void getDefaultMetalnessRoughness(float blockId, out float metalness, out float roughness) {
