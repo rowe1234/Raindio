@@ -20,4 +20,8 @@ Visual styles inspired by:
 - MacOS
 
 ## Game Graphics
-- <img width="3360" height="1984" alt="2026-08-12_10 50 20" src="https://github.com/user-attachments/assets/82cb4bb8-0f45-4718-bb22-2b34d2d96d64" />
+- <img width="1708" height="960" alt="2026-08-29_19 02 04" src="https://github.com/user-attachments/assets/0f29a0b1-c007-4952-b443-b49b9201fd1c" />
+- <img width="1708" height="960" alt="2026-08-29_19 30 09" src="https://github.com/user-attachments/assets/b73b4448-a7b5-4b3f-a86d-e6ca6296b955" />
+- <img width="1708" height="960" alt="2026-08-29_19 35 10" src="https://github.com/user-attachments/assets/d0fcd163-d461-416c-b031-c8d65b31530b" />
+
+
