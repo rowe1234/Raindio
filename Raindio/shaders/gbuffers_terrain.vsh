@@ -12,14 +12,12 @@ out vec3 vSkyColor;
 out vec3 vSunlight;
 out vec4 vParams; // 打包传输：x: vDayFactor, y: vSunIntensity, z: vEmissive
 
-// 替换 legacy attribute 为 330 标准 in 关键字
 in float mc_Entity;
 
 uniform vec3 sunPosition;
 uniform mat4 gbufferModelViewInverse;
 
 void main() {
-    // 使用 ftransform() 让 Iris / Sodium 自动完成顶点变换与区块偏移处理
     gl_Position = ftransform();
 
     vTexCoord = gl_TextureMatrix[0] * gl_MultiTexCoord0;
@@ -31,8 +29,11 @@ void main() {
     vEyePos = viewPos.xyz;
     vNormal = normalize(gl_NormalMatrix * gl_Normal);
 
-    // 昼夜与日光计算
-    vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+    // 修改：同步降低 Y 轴，保持点光照与表面计算方向一致
+    vec3 rawSunDir = (gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz;
+    rawSunDir.y *= 0.4;
+    vec3 worldSunDir = normalize(rawSunDir);
+
     float sunHeight = worldSunDir.y;
 
     float dayFactor = smoothstep(-0.05, 0.15, sunHeight);
@@ -49,7 +50,6 @@ void main() {
     vSunlight = (sunHeight > 0.0) ? mix(sunNight, mix(sunSunset, sunNoon, noonFactor), dayFactor) : vec3(0.18, 0.25, 0.40);
     float sunIntensity = (sunHeight > 0.0) ? 1.0 : 0.4;
 
-    // 自定义方块发光逻辑
     float emissive = 0.0;
     if (mc_Entity == 10000.0) {
         emissive = 0.7;

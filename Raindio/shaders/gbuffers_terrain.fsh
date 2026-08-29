@@ -3,9 +3,10 @@
 
 #define PI 3.14159265359
 
-// =================【亮度快捷调节杠杆】=================
 #define EMISSIVE_BRIGHTNESS 1.2
-// ========================================================
+#define PLANT_SSS_INTENSITY 0.22  
+#define PLANT_SSS_POWER     3.2   
+#define PLANT_SSS_WRAP      0.35  
 
 in vec3 vNormal;
 in vec4 vColor;
@@ -16,7 +17,7 @@ in float vBlockId;
 
 in vec3 vSkyColor;
 in vec3 vSunlight;
-in vec4 vParams; // x: vDayFactor, y: vSunIntensity, z: vEmissive
+in vec4 vParams; 
 
 uniform sampler2D texture;
 uniform sampler2D lightmap;
@@ -26,20 +27,17 @@ uniform sampler2D shadowtex0;
 uniform mat4 gbufferModelView;
 uniform sampler2D specular;
 
-// 补充阴影计算所需 Uniform
 uniform mat4 shadowProjection;
 uniform mat4 shadowModelView;
 
-// =================【雨天湿地 Uniform】=================
 uniform float rainStrength;
 uniform float frameTimeCounter;
 uniform vec3 cameraPosition;
 
-// 适配 4096 贴图大小的 PCSS 参数
 const float SHADOW_RES = 4096.0;
-const float LIGHT_SIZE = 1.2;     // 光源尺寸（控制半影扩散速度）
-const float MAX_PENUMBRA = 28.0;  // 最大半影扩散半径（纹素）
-const float MIN_PENUMBRA = 12.0;  // 最小滤波半径（防止接触面硬边锯齿）
+const float LIGHT_SIZE = 1.2;     
+const float MAX_PENUMBRA = 28.0;  
+const float MIN_PENUMBRA = 12.0;  
 
 const vec2 poissonDisk[16] = vec2[16](
     vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
@@ -65,15 +63,12 @@ float interleavedGradientNoise() {
     return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 }
 
-float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin) {
-    float NdotL_eff = isThin ? abs(NdotL) : NdotL;
-    if (NdotL_eff <= 0.001) return 0.0;
+float getPCSSShadowHD(vec3 eyePos, vec3 N, vec3 L, float NdotL, bool isThin) {
+    float NdotL_eff = isThin ? max(abs(NdotL), 0.1) : NdotL;
+    if (!isThin && NdotL_eff <= 0.001) return 0.0;
 
-    // 直接在片元内部组合阴影变换矩阵
     mat4 viewToShadow = shadowProjection * shadowModelView * gbufferModelViewInverse;
-
-    float normalBiasFactor = isThin ? 0.015 : 0.035;
-    vec3 biasedEyePos = eyePos + N * (normalBiasFactor * (1.0 - clamp(NdotL_eff, 0.0, 1.0)));
+    vec3 biasedEyePos = isThin ? (eyePos + L * 0.02) : (eyePos + N * (0.035 * (1.0 - clamp(NdotL_eff, 0.0, 1.0))));
 
     vec4 shadowClip = viewToShadow * vec4(biasedEyePos, 1.0);
     vec3 shadowNDC = shadowClip.xyz / shadowClip.w;
@@ -98,7 +93,6 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin) {
     float receiverDepth = shadowCoord.z - baseBias;
 
     const float oneTexel = 1.0 / SHADOW_RES;
-
     float searchRadius = LIGHT_SIZE * 12.0 * oneTexel * distortFactor;
     
     int blockerCount = 0;
@@ -122,7 +116,7 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin) {
     float filterRadius = clamp(penumbra * LIGHT_SIZE * 8.0 + MIN_PENUMBRA, MIN_PENUMBRA, MAX_PENUMBRA);
     filterRadius *= distortFactor;
 
-    float randomAngle = interleavedGradientNoise() * 6.2831853;
+    float randomAngle = isThin ? 0.0 : (interleavedGradientNoise() * 6.2831853);
     mat2 rotationMatrix = mat2(cos(randomAngle), sin(randomAngle), -sin(randomAngle), cos(randomAngle));
 
     float shadowSum = 0.0;
@@ -135,8 +129,7 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin) {
     }
 
     float shadow = shadowSum * 0.0625;
-
-    float blockerWeight = smoothstep(0.0, 2.0, float(blockerCount));
+    float blockerWeight = smoothstep(0.0, 4.0, float(blockerCount));
     shadow = mix(1.0, shadow, blockerWeight);
 
     vec2 edgeDist = abs(shadowCoord.st - 0.5) * 2.0;
@@ -175,7 +168,7 @@ void getDefaultMetalnessRoughness(float blockId, out float metalness, out float 
     else if (blockId == 41.0) roughness = 0.2;
     else if (blockId == 42.0) roughness = 0.3;
     else if (blockId == 133.0) roughness = 0.4;
-    else if (blockId == 2.0) roughness = 0.65;
+    else if (blockId == 2.0) roughness = 0.05;
 }
 
 layout(location = 0) out vec4 fragData0;
@@ -188,13 +181,29 @@ void main() {
 
     vec4 texColor = texture(texture, vTexCoord.st);
     vec4 albedo = vec4(texColor.rgb * vColor.rgb, texColor.a);
-    if (albedo.a < 0.1) discard;
 
-    bool isThin = (albedo.a < 0.99) || 
-                  (vBlockId >= 31.0 && vBlockId <= 38.0) || 
-                  (vBlockId >= 85.0 && vBlockId <= 113.0) || 
-                  (vBlockId >= 188.0 && vBlockId <= 192.0) || 
-                  vBlockId == 6.0 || vBlockId == 59.0 || vBlockId == 175.0;
+    // 补全玻璃板 ID 102.0
+    bool isGlass = (vBlockId == 2.0 || vBlockId == 20.0 || vBlockId == 79.0 || vBlockId == 95.0 || vBlockId == 102.0 || vBlockId == 160.0);
+    if (!isGlass && albedo.a < 0.1) discard;
+
+    bool isPlantID = (vBlockId == 6.0)  || (vBlockId == 18.0) || (vBlockId == 31.0) || 
+                     (vBlockId == 32.0) || (vBlockId == 37.0) || (vBlockId == 38.0) || 
+                     (vBlockId == 59.0) || (vBlockId == 83.0) || (vBlockId == 106.0) || 
+                     (vBlockId == 111.0) || (vBlockId == 141.0) || (vBlockId == 142.0) || 
+                     (vBlockId == 161.0) || (vBlockId == 175.0);
+
+    bool isBiomeTinted = (abs(vColor.r - vColor.g) > 0.015 || abs(vColor.g - vColor.b) > 0.015) && 
+                         (vBlockId != 8.0 && vBlockId != 9.0 && !isGlass);
+
+    // 严格限制玻璃进入 isPlant 与 isThin
+    bool isPlant = !isGlass && (isPlantID || isBiomeTinted || (albedo.a < 0.99 && vBlockId > 0.0));
+    bool isThin  = !isGlass && (isPlant || (vBlockId >= 85.0 && vBlockId <= 113.0) || (vBlockId >= 188.0 && vBlockId <= 192.0));
+
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(-vEyePos);
+
+    float rawNdotV = dot(N, V);
+    vec3 N_eff = (isThin && rawNdotV < 0.0) ? -N : N;
 
     vec4 specMap = texture(specular, vTexCoord.st);
     float defaultMetal, defaultRough;
@@ -204,13 +213,10 @@ void main() {
     float metalness = hasSpecMap ? specMap.r : defaultMetal;
     float roughness = max(hasSpecMap ? specMap.g : defaultRough, 0.04);
 
-    vec3 N = normalize(vNormal);
-    vec3 V = normalize(-vEyePos);
-
     vec4 lm = texture(lightmap, vLightmap);
 
     if (rainStrength > 0.001) {
-        vec3 worldNormal = normalize((gbufferModelViewInverse * vec4(N, 0.0)).xyz);
+        vec3 worldNormal = normalize((gbufferModelViewInverse * vec4(N_eff, 0.0)).xyz);
         float skyExposure = smoothstep(0.4, 0.85, lm.y);
         float upFactor = clamp(worldNormal.y * 0.7 + 0.3, 0.0, 1.0);
         float totalWetness = saturate(rainStrength) * skyExposure * upFactor;
@@ -219,22 +225,25 @@ void main() {
         roughness = mix(roughness, 0.12, totalWetness);
     }
 
-    vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+    vec3 rawSunDir = (gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz;
+    rawSunDir.y *= 0.4;
+    vec3 worldSunDir = normalize(rawSunDir);
+
     float sunHeight = worldSunDir.y;
     vec3 L = normalize((gbufferModelView * vec4(worldSunDir, 0.0)).xyz);
 
-    float NdotL_raw = dot(N, L);
+    float NdotL_raw = dot(N_eff, L);
     float NdotL = max(NdotL_raw, 0.0);
-    float NdotV = max(dot(N, V), 0.001);
+    float NdotV = max(dot(N_eff, V), 0.001);
     vec3 H = normalize(L + V);
-    float NdotH = max(dot(N, H), 0.001);
+    float NdotH = max(dot(N_eff, H), 0.001);
     float VdotH = max(dot(V, H), 0.001);
 
     float shadow = 1.0;
     float shadowStrength = smoothstep(-0.02, 0.15, sunHeight);
 
-    if (sunHeight > -0.01 && shadowStrength > 0.001 && (NdotL_raw > 0.001 || isThin)) {
-        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N, NdotL_raw, isThin), shadowStrength);
+    if (sunHeight > -0.01 && shadowStrength > 0.001 && (NdotL_raw > -0.2 || isThin)) {
+        shadow = mix(1.0, getPCSSShadowHD(vEyePos, N_eff, L, NdotL_raw, isThin), shadowStrength);
     }
 
     float skyAmbient = CurveBlockLightSky(lm.y);
@@ -247,10 +256,23 @@ void main() {
 
     vec3 albedoColor = albedo.rgb;
     vec3 F0 = mix(vec3(0.04), albedoColor, metalness);
+    if (isGlass) F0 = vec3(0.08);
+
     vec3 kS = fresnelSchlick(VdotH, F0);
     vec3 kD = (1.0 - kS) * (1.0 - metalness);
 
     vec3 diffuse = albedoColor * kD * (NdotL / PI);
+
+    vec3 plantSSS = vec3(0.0);
+    if (isPlant) {
+        float viewScatter = clamp(dot(-V, L), 0.0, 1.0);
+        float forwardSSS = pow(viewScatter, PLANT_SSS_POWER);
+        float wrapNdotL = clamp((-NdotL_raw + PLANT_SSS_WRAP) / (1.0 + PLANT_SSS_WRAP), 0.0, 1.0);
+        float sideSSS = wrapNdotL * 0.4;
+        vec3 sssColor = pow(albedoColor, vec3(1.1));
+        float sssShadow = mix(shadow, 1.0, 0.1); 
+        plantSSS = sssColor * (forwardSSS + sideSSS) * PLANT_SSS_INTENSITY * lightColor * sssShadow * (1.0 - metalness);
+    }
 
     float D = GGX_D(NdotH, roughness);
     float G = GGX_G(NdotL, NdotV, roughness);
@@ -259,10 +281,14 @@ void main() {
     specularColor *= (1.0 + 0.5 * smoothstep(0.5, 1.0, metalness));
     if (vBlockId == 2.0) specularColor *= 2.0;
 
-    vec3 directDiffuse = diffuse * lightColor * shadow;
+    if (isPlant && rainStrength < 0.1) {
+        specularColor *= 0.15;
+    }
+
+    vec3 directDiffuse = (diffuse * shadow + plantSSS) * lightColor;
     vec3 directSpecular = specularColor * lightColor * (shadow * NdotL);
 
-    vec3 R = reflect(-V, N);
+    vec3 R = reflect(-V, N_eff);
     float skyReflection = clamp(R.y * 0.5 + 0.5, 0.15, 1.0);
     float sunSideFactor = mix(0.4, 1.0, clamp(NdotL * shadow + 0.15, 0.0, 1.0));
 
@@ -280,7 +306,7 @@ void main() {
     float torchRainBoost = mix(1.0, 1.8, saturate(rainStrength));
     vec3 torchLight = customLightColor * (blockLight * (1.0 + torchRange * 0.3) * 0.45 * torchRainBoost);
     
-    float torchNdotL = max(dot(N, vec3(0.0, 0.8, 0.2)), 0.1);
+    float torchNdotL = max(dot(N_eff, vec3(0.0, 0.8, 0.2)), 0.1);
     vec3 torchContribution = albedoColor * (1.0 - metalness * 0.7) * torchLight * (torchNdotL / PI);
 
     float minLightStr = 0.003 * (1.0 - skyDirect) + 0.008;
@@ -294,8 +320,15 @@ void main() {
         vec3 glowingColor = rawTexture * (1.0 + vEmissive * EMISSIVE_BRIGHTNESS * emissiveRainBoost);
         color = mix(color, glowingColor, vEmissive);
     }
-    fragData0 = vec4(color, albedo.a);
-    float waterFlag = (vBlockId == 8.0 || vBlockId == 9.0 || vBlockId == 79.0) ? 0.79 : 1.0;
 
-    fragData1 = vec4(N.xy * 0.5 + 0.5, waterFlag, lm.y);
+    if (isGlass) {
+        float glassFresnel = pow(1.0 - NdotV, 4.0);
+        color += mix(vec3(0.1), vSkyColor, 0.5) * glassFresnel * 1.5;
+    }
+
+    fragData0 = vec4(color, isGlass ? max(albedo.a, 0.35) : albedo.a);
+    
+    float blockFlag = (vBlockId == 1.0 || vBlockId == 8.0 || vBlockId == 9.0) ? (1.0 / 255.0) : (isGlass ? (2.0 / 255.0) : 0.0);
+
+    fragData1 = vec4(N_eff.xy * 0.5 + 0.5, blockFlag, lm.y);
 }

@@ -39,7 +39,11 @@ void main() {
     vEyePos = viewPos.xyz;
     vNormal = normalize(normalMatrix * vaNormal);
 
-    vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+    // 修改：实体顶点着色器同步降低 Y 轴
+    vec3 rawSunDir = (gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz;
+    rawSunDir.y *= 0.4;
+    vec3 worldSunDir = normalize(rawSunDir);
+
     float sunHeight = worldSunDir.y;
 
     vDayFactor = smoothstep(-0.05, 0.15, sunHeight);

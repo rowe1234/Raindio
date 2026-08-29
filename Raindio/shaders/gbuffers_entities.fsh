@@ -9,7 +9,6 @@ in vec4 vTexCoord;
 in vec3 vEyePos;
 in vec2 vLightmap;
 
-// 优化：引入顶点着色器已算好的 Varying 变量，避免逐像素计算
 in vec3 vSkyColor;
 in vec3 vSunlight;
 in float vDayFactor;
@@ -106,7 +105,6 @@ float getPCSSShadowHD(vec3 eyePos, vec3 N, float NdotL, bool isThin, mat4 viewTo
     mat2 rotationMatrix = mat2(cosA, sinA, -sinA, cosA);
 
     float shadowSum = 0.0;
-    // 优化：将缩放与旋转矩阵提前合并，减少循环内向量乘法
     float stepScale = (filterRadius * oneTexel) / distortFactor;
     mat2 scaledRot = rotationMatrix * stepScale;
 
@@ -138,7 +136,7 @@ float GGX_G(float NdotL, float NdotV, float roughness) {
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    float m = 1.0 - cosTheta; // 优化：移除多余 clamp
+    float m = 1.0 - cosTheta;
     float m2 = m * m;
     return F0 + (1.0 - F0) * (m2 * m2 * m);
 }
@@ -158,7 +156,11 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 V = normalize(-vEyePos);
 
-    vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+    // 修改：实体同样降低 Y 轴，保持光影统一
+    vec3 rawSunDir = (gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz;
+    rawSunDir.y *= 0.4;
+    vec3 worldSunDir = normalize(rawSunDir);
+
     float sunHeight = worldSunDir.y;
     vec3 L = normalize((gbufferModelView * vec4(worldSunDir, 0.0)).xyz);
 
@@ -181,7 +183,6 @@ void main() {
     float skyDirect  = lm.y * lm.y;
     float blockLight = pow(lm.x, 2.5);
 
-    // 直接使用顶点着色器传过来的 Varying 预计算变量，删除了原本在此处的冗余计算
     vec3 directLightColor = mix(vSunlight, vSkyColor, 0.15 * (1.0 - vDayFactor));
     vec3 lightColor = directLightColor * skyDirect * (2.2 * vSunIntensity);
 
