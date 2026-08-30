@@ -1,6 +1,6 @@
 # [Raindio]
 
-A Minecraft shader pack with core logic assisted by DeepSeek AI.  
+A Minecraft shader pack with core logic assisted by Claude Code and Gemini.
 Visual styles inspired by:
 
 - **Water** – referenced from Wisdom Shaders  
