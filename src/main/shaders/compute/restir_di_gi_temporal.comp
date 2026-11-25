@@ -312,7 +312,7 @@ float evalTargetPdf(
         return luminance(uwContrib);
     }
 
-    float nearWrap = 0.55 * (1.0 - smoothstep(0.55, 1.95, dist));
+    float nearWrap = 0.78 * (1.0 - smoothstep(0.65, 2.20, dist));
     float NdotL = clamp((rawNdotL + nearWrap) / (1.0 + nearWrap), 0.0, 1.0);
     if (NdotL <= 0.001) return 0.0;
 
@@ -360,8 +360,9 @@ vec3 sampleLpvAtPos(vec3 sampleWorldPos, vec3 evalDir) {
     if (any(isnan(shG)) || any(isinf(shG))) shG = vec4(0.0);
     if (any(isnan(shB)) || any(isinf(shB))) shB = vec4(0.0);
 
-    vec4 shEval = vec4(0.88622693, -1.02332671 * evalDir.y, -1.02332671 * evalDir.z, -1.02332671 * evalDir.x);
-    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), vec3(0.0));
+    vec4 shEval = vec4(0.88622693, -0.58 * evalDir.y, -0.58 * evalDir.z, -0.58 * evalDir.x);
+    vec3 isoFloor = max(vec3(shR.x, shG.x, shB.x), vec3(0.0)) * 0.36;
+    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), isoFloor);
     irr = irr / (vec3(1.0) + irr * 0.14);
     return irr * lpvFade;
 }

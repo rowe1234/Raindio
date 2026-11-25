@@ -43,6 +43,15 @@ layout(set = 0, binding = 18) uniform usampler3D uVoxelPalette;    // LOD 0: 64^
 layout(set = 0, binding = 19) uniform usampler3D uFarPalette;      // LOD 1: 128x64x128 R16_UINT block palette ID
 
 layout(set = 0, binding = 20, rgba16f) uniform writeonly image2D uReflOut;
+layout(set = 0, binding = 21) uniform sampler2D  uHwRtHitTex;      // Apple M3+ Metal Hardware RT hit buffer (RGBA32F; 0 on non-M3)
+
+struct HwRayDesc {
+    vec4 originAndTMax; // xyz = worldPos, w = maxDist
+    vec4 dirAndActive;  // xyz = reflectWorldDir, w = 1.0 if active
+};
+layout(std430, set = 0, binding = 22) writeonly buffer HwRayOutBuf {
+    HwRayDesc rays[];
+} uHwRays;
 
 // Provide compute-shader equivalent of gl_FragCoord for lib/clouds.glsl dither
 #define gl_FragCoord vec4(vec2(gl_GlobalInvocationID.xy) + 0.5, 0.0, 1.0)
@@ -592,12 +601,19 @@ void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     if (gid.x >= outSize.x || gid.y >= outSize.y) return;
 
+    ivec2 hwSize = max(textureSize(uHwRtHitTex, 0), ivec2(1));
+    ivec2 hwGid = clamp((gid * hwSize) / max(outSize, ivec2(1)), ivec2(0), hwSize - ivec2(1));
+    ivec2 hwRepGid = (hwGid * outSize) / hwSize;
+    bool isHwEmitter = (gid == hwRepGid);
+    uint hwRayIdx = uint(hwGid.y * hwSize.x + hwGid.x);
+
     float existingGTAO = texelFetch(colortex9In, gid, 0).a;
     vec2 uv = (vec2(gid) + 0.5) / vec2(max(outSize, ivec2(1)));
     ivec2 fullSize = max(textureSize(depthtex0, 0), ivec2(1));
     ivec2 fullPx = clamp(ivec2(uv * vec2(fullSize)), ivec2(0), fullSize - ivec2(1));
     float rawDepth = texelFetch(depthtex0, fullPx, 0).r;
     if (!isSceneDepth(rawDepth)) {
+        if (isHwEmitter) uHwRays.rays[hwRayIdx].dirAndActive = vec4(0.0);
         imageStore(uReflOut, gid, vec4(0.0, 0.0, 0.0, existingGTAO));
         return;
     }
@@ -614,6 +630,7 @@ void main() {
                        && geomWorldN.y > 0.45 && skyLightData > 0.60);
 
     if (!isWater && !isGlass && !isWetFloor) {
+        if (isHwEmitter) uHwRays.rays[hwRayIdx].dirAndActive = vec4(0.0);
         imageStore(uReflOut, gid, vec4(0.0, 0.0, 0.0, existingGTAO));
         return;
     }
@@ -647,9 +664,10 @@ void main() {
     vec3 reflectViewDir = normalize(mat3(gbufferModelView) * reflectWorldDir);
 
     float dither = interleavedGradientNoise(vec2(gid) + 0.5);
+    vec3 startWorldPos = worldPos + flatWorldN * (isWater ? 0.06 : 0.05);
 
     // =========================================================================
-    // Stage 1: SEUS PTGI-Style Viewport-Clipped Full-Render-Distance Screen-Space Trace
+    // Stage 1: Viewport-Clipped Full-Render-Distance Primary Screen-Space Trace
     // =========================================================================
     vec4 ssrHit = vec4(0.0);
     bool needsVoxelFallback = true;
@@ -657,6 +675,13 @@ void main() {
         ssrHit = traceScreenSpacePrimary(
             viewPos, reflectViewDir, realSunDir, fullSize, dither, isWater, needsVoxelFallback
         );
+    }
+
+    // Emit compact HW RT reflection ray matching textureSize(uHwRtHitTex, 0) (<=640x360)
+    if (isHwEmitter) {
+        bool emitActive = (ssrHit.a < 0.995) && needsVoxelFallback;
+        uHwRays.rays[hwRayIdx].originAndTMax = vec4(startWorldPos, 128.0);
+        uHwRays.rays[hwRayIdx].dirAndActive  = vec4(reflectWorldDir, emitActive ? 1.0 : 0.0);
     }
 
     vec3 reflection;
@@ -675,7 +700,6 @@ void main() {
             vec3 skyReflDir = normalize(vec3(reflectWorldDir.x, max(reflectWorldDir.y, 0.03), reflectWorldDir.z));
             vec3 skyRefl = sampleSkyLUT(skyReflDir);
 
-            // Reflect real volumetric clouds into water & glass (fast 14-step trace)
             if (skyLightFactor > 0.10 && skyReflDir.y > 0.03) {
                 vec3 skyZenithLUT  = sampleSkyLUT(vec3(0.0, 0.95, 0.0));
                 vec3 skyHorizonLUT = sampleSkyLUT(normalize(vec3(skyReflDir.x, 0.10, skyReflDir.z)));
@@ -701,33 +725,83 @@ void main() {
 
         vec3 fallbackRefl = skyFallback;
         // =====================================================================
-        // Stage 2: 3D Voxel RT Fallback ONLY when ray exited viewport or was occluded!
-        //   Prevents coarse 4m macro-voxels from ever bleeding into visible on-screen sky/hills.
+        // Stage 2: Apple M3/M4/M5+ Metal Hardware RT Complete Takeover (0% software voxel DDA)
+        //          -> Automatic Vulkan Voxel RT Fallback on M1/M2/Windows/Linux (hwHit.a == 0.0)
         // =====================================================================
         if (needsVoxelFallback) {
-            vec3 startWorldPos = worldPos + flatWorldN * (isWater ? 0.06 : 0.05);
-            vec3 rtColor, transmittance;
-            float exitT;
-            bool hitLod0 = traceVoxelReflectionLod0(
-                startWorldPos, reflectWorldDir, realSunDir, worldLightDir,
-                skyCol, sunCol, sunInt, skyLightFactor,
-                rtColor, transmittance, exitT
-            );
+            // Reproject to previous frame UV for zero-stall 1-frame-pipelined Metal Hardware RT hit buffer
+            vec3 prevWorldRel = worldPos - previousCameraPosition;
+            vec4 prevClip = gbufferPreviousProjection * (gbufferPreviousModelView * vec4(prevWorldRel, 1.0));
+            vec2 hwUV = uv;
+            if (prevClip.w > 1e-4) {
+                vec2 reproj = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+                if (reproj.x > 0.002 && reproj.x < 0.998 && reproj.y > 0.002 && reproj.y < 0.998) {
+                    hwUV = reproj;
+                }
+            }
 
-            if (hitLod0) {
-                fallbackRefl = rtColor;
-            } else {
-                vec3 farColor;
-                bool hitLod1 = traceFarVoxelReflectionLod1(
-                    startWorldPos, reflectWorldDir, exitT, realSunDir, worldLightDir,
-                    skyCol, sunCol, sunInt, skyLightFactor, skyFallback,
-                    farColor
+            vec4 hwHit = textureLod(uHwRtHitTex, hwUV, 0.0);
+            if (hwHit.a > 1.5) {
+                // Hardware RT confirmed open sky miss (hitValid == 2.0): completely bypass all software voxel DDA!
+                fallbackRefl = skyFallback;
+            } else if (hwHit.a > 0.5 && hwHit.r > 0.05) {
+                // Hardware RT triangle hit from Apple M3 / M4 / M5+ Metal BVH/TLAS!
+                uint packedFlags = uint(hwHit.g + 0.5);
+                uint normId = packedFlags & 7u;
+                bool isLeaf = ((packedFlags >> 3u) & 1u) != 0u;
+                float emLevel = float((packedFlags >> 4u) & 255u) * (1.0 / 255.0);
+                uint palId = uint(hwHit.b + 0.5);
+
+                const vec3 FACE_NORMALS[6] = vec3[6](
+                    vec3( 1.0,  0.0,  0.0), vec3(-1.0,  0.0,  0.0),
+                    vec3( 0.0,  1.0,  0.0), vec3( 0.0, -1.0,  0.0),
+                    vec3( 0.0,  0.0,  1.0), vec3( 0.0,  0.0, -1.0)
                 );
-                fallbackRefl = (hitLod1 ? farColor : skyFallback) * transmittance;
+                vec3 hitNormal = FACE_NORMALS[min(normId, 5u)];
+                vec3 hitWorldPos = startWorldPos + reflectWorldDir * hwHit.r;
+                vec3 hitRel = hitWorldPos - cameraPosition;
+
+                vec3 albedo = sampleRealBlockAtlasAlbedo(palId, isLeaf ? vec3(0.05, 0.18, 0.04) : vec3(0.18), hitWorldPos, hitNormal, isLeaf);
+                if (emLevel > 0.20) {
+                    fallbackRefl = albedo * (1.5 + emLevel * 3.5);
+                } else {
+                    float rainClear = 1.0 - saturate(rainStrength);
+                    float rawNdotL = dot(hitNormal, worldLightDir);
+                    float NdotL = isLeaf ? clamp((rawNdotL + 0.45) / 1.45, 0.0, 1.0) : max(rawNdotL, 0.0);
+                    float sh = (NdotL > 0.001) ? sampleShadowAtWorldRel(hitRel, hitNormal) : 0.0;
+                    vec3 direct = sunCol * (sunInt * (2.6 * rainClear + 0.20) * NdotL * sh);
+                    if (isLeaf && sh > 0.1) direct += sunCol * (sunInt * 0.24 * rainClear * sh);
+                    vec3 lpvIrr = sampleLpvAtAirPos(hitWorldPos + hitNormal * 0.48, hitNormal);
+                    vec3 skyAmb = skyCol * (mix(0.14, 0.28, saturate(hitNormal.y * 0.5 + 0.5)) * skyLightFactor);
+                    vec3 hitViewPos = (gbufferModelView * vec4(hitRel, 1.0)).xyz;
+                    vec3 lit = applyTerrainFogCompute(albedo * (direct + skyAmb + lpvIrr * 1.15), hitViewPos, realSunDir);
+                    float farFade = smoothstep(96.0, 126.0, hwHit.r);
+                    fallbackRefl = mix(lit, skyFallback, farFade);
+                }
+            } else {
+                // Standard Vulkan Voxel RT Fallback (non-M3 / M1 / M2 / Windows / Linux / miss)
+                vec3 rtColor, transmittance;
+                float exitT;
+                bool hitLod0 = traceVoxelReflectionLod0(
+                    startWorldPos, reflectWorldDir, realSunDir, worldLightDir,
+                    skyCol, sunCol, sunInt, skyLightFactor,
+                    rtColor, transmittance, exitT
+                );
+
+                if (hitLod0) {
+                    fallbackRefl = rtColor;
+                } else {
+                    vec3 farColor;
+                    bool hitLod1 = traceFarVoxelReflectionLod1(
+                        startWorldPos, reflectWorldDir, exitT, realSunDir, worldLightDir,
+                        skyCol, sunCol, sunInt, skyLightFactor, skyFallback,
+                        farColor
+                    );
+                    fallbackRefl = (hitLod1 ? farColor : skyFallback) * transmittance;
+                }
             }
         }
 
-        // Seamless cross-fade: crisp SSR inside viewport -> 3D Voxel RT + Clouds at borders/off-screen
         reflection = mix(fallbackRefl, ssrHit.rgb, ssrHit.a);
     }
 

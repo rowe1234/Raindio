@@ -154,7 +154,8 @@ void main() {
         float fluxG = max(0.0, dot(nG, evalLobe)) * FACE_GAIN;
         float fluxB = max(0.0, dot(nB, evalLobe)) * FACE_GAIN;
 
-        vec4 shWeight = vec4(SH_C0, 0.90 * SH_C1 * travelDir.y, 0.90 * SH_C1 * travelDir.z, 0.90 * SH_C1 * travelDir.x);
+        // Hanning-windowed L1 SH (0.50 * SH_C1) eliminates negative-lobe ringing next to strong emissive blocks
+        vec4 shWeight = vec4(SH_C0, 0.50 * SH_C1 * travelDir.y, 0.50 * SH_C1 * travelDir.z, 0.50 * SH_C1 * travelDir.x);
         outR += shWeight * fluxR;
         outG += shWeight * fluxG;
         outB += shWeight * fluxB;
@@ -177,7 +178,7 @@ void main() {
 
             vec3 bounced = min(vec3(inR, inG, inB) * wallAlbedos[w] * perWallGain, vec3(inR, inG, inB) * 0.85);
             vec3 bounceDir = -intoWallDir;
-            vec4 bounceSH = vec4(SH_C0, 0.85 * SH_C1 * bounceDir.y, 0.85 * SH_C1 * bounceDir.z, 0.85 * SH_C1 * bounceDir.x);
+            vec4 bounceSH = vec4(SH_C0, 0.50 * SH_C1 * bounceDir.y, 0.50 * SH_C1 * bounceDir.z, 0.50 * SH_C1 * bounceDir.x);
             outR += bounceSH * bounced.r;
             outG += bounceSH * bounced.g;
             outB += bounceSH * bounced.b;
@@ -218,7 +219,7 @@ void main() {
                     vec3 sunCol = mix(vec3(1.0, 0.48, 0.14), vec3(1.0, 0.97, 0.88), saturate(worldSunDir.y * 2.4));
 
                     vec3 bounceRadiance = bounceAlbedo * sunCol * (emitterNdotL * sunVis * sVis * 2.65);
-                    vec4 bounceSH = vec4(SH_C0, 0.75 * SH_C1 * bounceN.y, 0.75 * SH_C1 * bounceN.z, 0.75 * SH_C1 * bounceN.x);
+                    vec4 bounceSH = vec4(SH_C0, 0.50 * SH_C1 * bounceN.y, 0.50 * SH_C1 * bounceN.z, 0.50 * SH_C1 * bounceN.x);
                     outR += bounceSH * bounceRadiance.r;
                     outG += bounceSH * bounceRadiance.g;
                     outB += bounceSH * bounceRadiance.b;

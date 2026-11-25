@@ -285,7 +285,7 @@ vec3 evalUnshadowedDirect(
         return radiance * uwTrans * (0.58 + 0.42 * backGlow) * transNdotL;
     }
 
-    float nearWrap = 0.55 * (1.0 - smoothstep(0.55, 1.95, dist));
+    float nearWrap = 0.78 * (1.0 - smoothstep(0.65, 2.20, dist));
     float NdotL = clamp((rawNdotL + nearWrap) / (1.0 + nearWrap), 0.0, 1.0);
     if (NdotL <= 0.001) return vec3(0.0);
 
@@ -341,8 +341,10 @@ vec3 sampleLpvIrradiance(vec3 worldPos, vec3 worldRel, vec3 worldN) {
     if (any(isnan(shG)) || any(isinf(shG))) shG = vec4(0.0);
     if (any(isnan(shB)) || any(isinf(shB))) shB = vec4(0.0);
 
-    vec4 shEval = vec4(0.88622693, -1.02332671 * worldN.y, -1.02332671 * worldN.z, -1.02332671 * worldN.x);
-    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), vec3(0.0));
+    // Non-negative windowed L1 SH evaluation with isotropic floor (prevents dark blue-black ringing next to glowstone/lanterns)
+    vec4 shEval = vec4(0.88622693, -0.58 * worldN.y, -0.58 * worldN.z, -0.58 * worldN.x);
+    vec3 isoFloor = max(vec3(shR.x, shG.x, shB.x), vec3(0.0)) * 0.36;
+    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), isoFloor);
     irr = irr / (vec3(1.0) + irr * 0.12);
     return irr * lpvFade;
 }

@@ -19,6 +19,7 @@ import com.raindio.vulkan.RaindioEntityGBufferRenderer;
 import com.raindio.vulkan.RaindioEntityShadowRenderer;
 import com.raindio.vulkan.RaindioHandRenderer;
 import com.raindio.vulkan.RaindioLpvManager;
+import com.raindio.vulkan.RaindioMetalRtManager;
 import com.raindio.vulkan.RaindioNoiseTexture;
 import com.raindio.vulkan.RaindioPointLightManager;
 import com.raindio.vulkan.RaindioRtReflectionManager;
@@ -56,6 +57,7 @@ public final class RaindioFrameController {
     private final RaindioHandRenderer handRenderer = new RaindioHandRenderer();
     private final RaindioCompositePipelines compositePipelines = new RaindioCompositePipelines();
     private final RaindioLpvManager lpvManager = new RaindioLpvManager();
+    private final RaindioMetalRtManager metalRtManager = new RaindioMetalRtManager();
     private final RaindioPointLightManager pointLightManager = new RaindioPointLightManager();
     private final RaindioRtReflectionManager rtReflectionManager = new RaindioRtReflectionManager();
     private final RaindioAutoExposure autoExposure = new RaindioAutoExposure();
@@ -174,6 +176,8 @@ public final class RaindioFrameController {
             );
             pointLightManager.updateLights(cameraState, config);
             lpvManager.updateVoxels(cameraState, config);
+            metalRtManager.updateSections(cameraState, lpvManager);
+            lpvManager.setSkipFarSoftwareVoxels(metalRtManager.isHardwareRtActive());
 
             // 1. Render shadow map, opaque terrain + entity G-Buffer, depthtex1 snapshot, translucent tint, and water G-Buffer
             boolean renderedChunks = chunkPipelines.renderShadowAndGBuffers(
@@ -200,6 +204,7 @@ public final class RaindioFrameController {
                     lpvManager,
                     pointLightManager,
                     rtReflectionManager,
+                    metalRtManager,
                     autoExposure,
                     config,
                     mainColorView,
@@ -296,6 +301,7 @@ public final class RaindioFrameController {
     public void onClose() {
         autoExposure.close();
         rtReflectionManager.close();
+        metalRtManager.close();
         pointLightManager.close();
         lpvManager.close();
         handRenderer.close();

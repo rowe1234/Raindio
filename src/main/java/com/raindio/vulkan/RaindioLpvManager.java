@@ -199,6 +199,14 @@ public final class RaindioLpvManager implements AutoCloseable {
     private boolean imagesTransitioned = false;
     private boolean initialized = false;
     private boolean unavailable = false;
+    private boolean skipFarSoftwareVoxels = false;
+
+    /**
+     * When Apple M3/M4/M5+ Metal Hardware RT is active, disable redundant 128x64x128 far software voxel scanning/uploads.
+     */
+    public void setSkipFarSoftwareVoxels(boolean skip) {
+        this.skipFarSoftwareVoxels = skip;
+    }
 
     public boolean isReady() {
         return initialized && !unavailable && shRView[activeShIndex] != VK12.VK_NULL_HANDLE
@@ -340,6 +348,7 @@ public final class RaindioLpvManager implements AutoCloseable {
      * 2x finer geometry than 4m cells; only scans newly entered 2m slabs + 3 rolling chunk columns/frame.
      */
     private void updateFarVoxels(ClientLevel level, int px, int py, int pz, boolean forceFull) {
+        if (skipFarSoftwareVoxels) return;
         int newFarX = (px >> 1) - (FAR_XZ / 2);
         int newFarY = (py >> 1) - (FAR_Y / 2);
         int newFarZ = (pz >> 1) - (FAR_XZ / 2);
@@ -521,7 +530,7 @@ public final class RaindioLpvManager implements AutoCloseable {
      * Resolves a unique BlockState into a compact 1..1023 palette ID and records its live
      * Minecraft TextureAtlasSprite UVs (top & side faces) plus BlockColors tint into cpuPaletteLut.
      */
-    private short resolveBlockPaletteId(BlockState state) {
+    short resolveBlockPaletteId(BlockState state) {
         Integer cached = paletteMap.get(state);
         if (cached != null) return cached.shortValue();
         if (nextPaletteId >= PALETTE_MAX) return 0;

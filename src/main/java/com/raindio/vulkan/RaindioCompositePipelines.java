@@ -197,6 +197,7 @@ public final class RaindioCompositePipelines implements AutoCloseable {
             RaindioLpvManager lpvManager,
             RaindioPointLightManager pointLights,
             RaindioRtReflectionManager rtReflections,
+            RaindioMetalRtManager metalRt,
             RaindioAutoExposure autoExposure,
             RaindioConfig config,
             GpuTextureView mainColorView,
@@ -254,7 +255,7 @@ public final class RaindioCompositePipelines implements AutoCloseable {
             lpvManager.dispatch(encoder, att, uniforms, config.lpvStepsPerFrame);
         }
 
-        // 2c. ReSTIR GI + Clustered Point Lights -> pointLightTex
+        // 2c. ReSTIR GI + Clustered Point Lights (0-latency on-GPU Vulkan compute) -> pointLightTex
         if (pointLights != null && pointLights.isAvailable()) {
             pointLights.dispatch(encoder, att, uniforms, lpvManager, debugView, config.pointLightDdaTaps, config.pointLightTopK);
         }
@@ -278,9 +279,9 @@ public final class RaindioCompositePipelines implements AutoCloseable {
             pass.draw(3, 1, 0, 0);
         }
 
-        // 3b. Native Vulkan SEUS PTGI-Style Hybrid Ray-Traced Reflections -> colortex9.rgb (preserves colortex9.a GTAO)
+        // 3b. Hybrid Ray-Traced Reflections (Apple M3+ Metal Hardware RT Cores when available, else Vulkan Voxel RT) -> colortex9.rgb
         if (rtReflections != null && rtReflections.isAvailable()) {
-            rtReflections.dispatch(encoder, att, uniforms, noise, lpvManager);
+            rtReflections.dispatch(encoder, att, uniforms, noise, lpvManager, metalRt);
         }
 
         // 4. composite3: reads colortex0 -> writes colortex0Scratch (ZERO fullscreen copy ping-pong!)

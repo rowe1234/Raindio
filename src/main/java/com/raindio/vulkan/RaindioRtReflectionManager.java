@@ -18,6 +18,7 @@ import com.raindio.mixin.VulkanCommandEncoderAccessor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.LongBuffer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -26,7 +27,10 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.vma.Vma;
 import org.lwjgl.util.vma.VmaAllocationCreateInfo;
+import org.lwjgl.util.vma.VmaAllocationInfo;
 import org.lwjgl.vulkan.VK12;
+import org.lwjgl.vulkan.VkBufferCreateInfo;
+import org.lwjgl.vulkan.VkBufferImageCopy;
 import org.lwjgl.vulkan.VkClearColorValue;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkComputePipelineCreateInfo;
@@ -49,9 +53,12 @@ import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkWriteDescriptorSet;
 
 /**
- * Native Vulkan 3D World-Space Ray-Traced Reflections Compute Manager.
- * Replaces screen-space SSR with 64^3 3D Voxel DDA + 4x4x4 Sub-Voxel + Shadow-Map + LPV + Sky RT reflections,
- * writing directly into att.colortex9().rgb while preserving colortex9.a (GTAO from composite2).
+ * Native Vulkan Hybrid Ray-Traced Reflections Compute Manager:
+ * - Stage 1: Full-render-distance viewport-clipped screen-space raymarch (exact texelFetch).
+ * - Stage 2: Apple Silicon M3 / M4 / M5+ Metal Hardware RT Cores (via RaindioMetalRtManager zero-stall UMA ring)
+ *            with seamless automatic fallback to 2-level Cascaded 3D Voxel RT + live Block Texture Atlas.
+ * - Stage 3: Physical Atmosphere Sky LUT + Volumetric Cloud Reflections.
+ * Writes directly into att.colortex9().rgb while preserving colortex9.a (GTAO from composite2).
  */
 public final class RaindioRtReflectionManager implements AutoCloseable {
     private static final String REFL_SPV = "/assets/raindio/shaders/spirv/compute/rt_reflections.comp.spv";
@@ -65,13 +72,29 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
     private long descriptorPool = VK12.VK_NULL_HANDLE;
     private final long[] descSets = new long[RING_SIZE];
     private int ringIndex = 0;
+    private long framesDispatched = 0L;
 
     private int outWidth = -1;
     private int outHeight = -1;
+    private int hwWidth = -1;
+    private int hwHeight = -1;
     private long outImage = VK12.VK_NULL_HANDLE;
     private long outAlloc = 0L;
     private long outView  = VK12.VK_NULL_HANDLE;
     private boolean imageTransitioned = false;
+
+    // Zero-stall UMA ring buffers & hit texture for Apple M3+ Metal Hardware RT Cores
+    private long hwHitImage = VK12.VK_NULL_HANDLE;
+    private long hwHitAlloc = 0L;
+    private long hwHitView  = VK12.VK_NULL_HANDLE;
+    private final long[] hwRayBufs = new long[RING_SIZE];
+    private final long[] hwRayAllocs = new long[RING_SIZE];
+    private final long[] hwRayMappedPtrs = new long[RING_SIZE];
+    private final long[] hwHitStagingBufs = new long[RING_SIZE];
+    private final long[] hwHitStagingAllocs = new long[RING_SIZE];
+    private final long[] hwHitMappedPtrs = new long[RING_SIZE];
+    private int hwRayBufferBytes = 0;
+    private int hwHitBufferBytes = 0;
 
     private boolean initialized = false;
     private boolean unavailable = false;
@@ -85,7 +108,8 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
             RaindioAttachments att,
             RaindioUniformManager uniforms,
             RaindioNoiseTexture noise,
-            RaindioLpvManager lpv
+            RaindioLpvManager lpv,
+            RaindioMetalRtManager metalRt
     ) {
         if (unavailable || att == null || uniforms == null || noise == null || lpv == null || !lpv.isReady()) {
             return false;
@@ -118,7 +142,7 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         int w = c9Tex.getWidth(0);
         int h = c9Tex.getHeight(0);
         ensureOutputImage(w, h);
-        if (outView == VK12.VK_NULL_HANDLE) return false;
+        if (outView == VK12.VK_NULL_HANDLE || hwHitView == VK12.VK_NULL_HANDLE) return false;
 
         VkCommandBuffer cmd = accessor.raindio$commandBuffer();
         if (cmd == null) return false;
@@ -156,7 +180,44 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             if (!imageTransitioned) {
                 clearAndInitImage(cmd, stack, outImage);
+                clearAndInitImageZero(cmd, stack, hwHitImage);
                 imageTransitioned = true;
+            }
+
+            // On Apple Silicon M3 / M4 / M5+ (Apple9+ Hardware RT Cores):
+            // Persistently mapped <=480x270 SLC-resident HW RT grid (zero map/unmap, zero stall, 0ms when no water!)
+            if (metalRt != null && metalRt.isReady() && framesDispatched >= 2) {
+                int prevSlot = (slot + RING_SIZE - 2) % RING_SIZE;
+                long rayAddr = hwRayMappedPtrs[prevSlot];
+                long hitAddr = hwHitMappedPtrs[slot];
+                if (rayAddr != 0L && hitAddr != 0L) {
+                    int rayCount = hwWidth * hwHeight;
+                    Vma.vmaInvalidateAllocation(vmaAllocator, hwRayAllocs[prevSlot], 0, hwRayBufferBytes);
+                    ByteBuffer rayBuf = MemoryUtil.memByteBuffer(rayAddr, hwRayBufferBytes).order(ByteOrder.nativeOrder());
+                    ByteBuffer hitBuf = MemoryUtil.memByteBuffer(hitAddr, hwHitBufferBytes).order(ByteOrder.nativeOrder());
+                    boolean traced = metalRt.traceReflectionRaysAsync(rayCount, rayBuf, hitBuf);
+                    if (traced) {
+                        Vma.vmaFlushAllocation(vmaAllocator, hwHitStagingAllocs[slot], 0, hwHitBufferBytes);
+                        transitionImage(cmd, stack, hwHitImage,
+                                VK12.VK_IMAGE_LAYOUT_GENERAL, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK12.VK_ACCESS_SHADER_READ_BIT, VK12.VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK12.VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+                        VkBufferImageCopy.Buffer copyReg = VkBufferImageCopy.calloc(1, stack);
+                        copyReg.bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+                        copyReg.imageSubresource().aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+                        copyReg.imageOffset().set(0, 0, 0);
+                        copyReg.imageExtent().set(hwWidth, hwHeight, 1);
+
+                        VK12.vkCmdCopyBufferToImage(cmd, hwHitStagingBufs[slot], hwHitImage,
+                                VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copyReg);
+
+                        transitionImage(cmd, stack, hwHitImage,
+                                VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK12.VK_IMAGE_LAYOUT_GENERAL,
+                                VK12.VK_ACCESS_TRANSFER_WRITE_BIT, VK12.VK_ACCESS_SHADER_READ_BIT,
+                                VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    }
+                }
             }
 
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -169,7 +230,7 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
                     lpv.shRView(), lpv.shGView(), lpv.shBView(), lpv.linearRepeatSampler(),
                     c0View, noiseView,
                     blockAtlasView, paletteLutView, voxelPaletteView, farPaletteView,
-                    outView
+                    outView, hwHitView, hwRayBufs[slot]
             );
 
             int groupsX = (outWidth + 15) / 16;
@@ -210,6 +271,7 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
                     VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            framesDispatched++;
         }
 
         return true;
@@ -224,13 +286,15 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer pHandle = stack.mallocLong(1);
 
-            // 0=UBO, 1..19=19 samplers, 20=1 storage image
-            VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(21, stack);
+            // 0=UBO, 1..19=19 samplers, 20=1 storage image, 21=uHwRtHitTex sampler, 22=HwRayOutBuf SSBO
+            VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(23, stack);
             bind(bindings.get(0), 0, VK12.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
             for (int i = 1; i <= 19; i++) {
                 bind(bindings.get(i), i, VK12.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
             }
             bind(bindings.get(20), 20, VK12.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+            bind(bindings.get(21), 21, VK12.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            bind(bindings.get(22), 22, VK12.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
             VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                     .sType$Default().pBindings(bindings);
@@ -244,10 +308,11 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
 
             this.pipeline = createComputePipeline(stack, spvBytes, pipeLayout);
 
-            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(4, stack);
             poolSizes.get(0).type(VK12.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(RING_SIZE);
-            poolSizes.get(1).type(VK12.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING_SIZE * 19);
+            poolSizes.get(1).type(VK12.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING_SIZE * 20);
             poolSizes.get(2).type(VK12.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(RING_SIZE);
+            poolSizes.get(3).type(VK12.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(RING_SIZE);
 
             VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType$Default().maxSets(RING_SIZE).pPoolSizes(poolSizes);
@@ -264,7 +329,7 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         }
 
         this.initialized = true;
-        RaindioClientMod.LOGGER.info("[Raindio] Initialized Native Vulkan 3D World-Space RT Reflections pipeline.");
+        RaindioClientMod.LOGGER.info("[Raindio] Initialized Native Vulkan Hybrid RT Reflections pipeline (with Apple M3+ Metal RT hook).");
     }
 
     private void ensureOutputImage(int w, int h) {
@@ -276,44 +341,89 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         destroyOutputImage();
         this.outWidth = safeW;
         this.outHeight = safeH;
+        // SLC-resident HW RT reflection grid (<=480x270 = ~6MB total, fits inside Apple M5 System Level Cache!)
+        this.hwWidth = Math.max(1, Math.min(480, (safeW + 1) / 2));
+        this.hwHeight = Math.max(1, Math.min(270, (safeH + 1) / 2));
+        this.hwRayBufferBytes = hwWidth * hwHeight * 32; // 2x vec4 per ray
+        this.hwHitBufferBytes = hwWidth * hwHeight * 16; // 1x vec4 (RGBA32F) per hit
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkImageCreateInfo imgInfo = VkImageCreateInfo.calloc(stack)
-                    .sType$Default()
-                    .imageType(VK12.VK_IMAGE_TYPE_2D)
-                    .format(VK12.VK_FORMAT_R16G16B16A16_SFLOAT)
-                    .mipLevels(1).arrayLayers(1)
-                    .samples(VK12.VK_SAMPLE_COUNT_1_BIT)
-                    .tiling(VK12.VK_IMAGE_TILING_OPTIMAL)
-                    .usage(VK12.VK_IMAGE_USAGE_STORAGE_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-                    .sharingMode(VK12.VK_SHARING_MODE_EXCLUSIVE)
-                    .initialLayout(VK12.VK_IMAGE_LAYOUT_UNDEFINED);
-            imgInfo.extent().set(safeW, safeH, 1);
+            long[] out = create2DImage(stack, safeW, safeH, VK12.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK12.VK_IMAGE_USAGE_STORAGE_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            this.outImage = out[0]; this.outAlloc = out[1]; this.outView = out[2];
 
-            VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
-                    .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            long[] hit = create2DImage(stack, hwWidth, hwHeight, VK12.VK_FORMAT_R32G32B32A32_SFLOAT,
+                    VK12.VK_IMAGE_USAGE_SAMPLED_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            this.hwHitImage = hit[0]; this.hwHitAlloc = hit[1]; this.hwHitView = hit[2];
 
-            LongBuffer pImg = stack.mallocLong(1);
-            PointerBuffer pAlloc = stack.mallocPointer(1);
-            checkVk(Vma.vmaCreateImage(vmaAllocator, imgInfo, allocInfo, pImg, pAlloc, null), "vmaCreateImage(rtRefl)");
-            this.outImage = pImg.get(0);
-            this.outAlloc = pAlloc.get(0);
+            for (int i = 0; i < RING_SIZE; i++) {
+                long[] rb = createHostBuffer(stack, hwRayBufferBytes,
+                        VK12.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                hwRayBufs[i] = rb[0]; hwRayAllocs[i] = rb[1]; hwRayMappedPtrs[i] = rb[2];
 
-            VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
-                    .sType$Default()
-                    .image(outImage)
-                    .viewType(VK12.VK_IMAGE_VIEW_TYPE_2D)
-                    .format(VK12.VK_FORMAT_R16G16B16A16_SFLOAT);
-            viewInfo.subresourceRange()
-                    .aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT)
-                    .baseMipLevel(0).levelCount(1)
-                    .baseArrayLayer(0).layerCount(1);
-
-            LongBuffer pView = stack.mallocLong(1);
-            checkVk(VK12.vkCreateImageView(vkDevice, viewInfo, null, pView), "vkCreateImageView(rtRefl)");
-            this.outView = pView.get(0);
+                long[] hb = createHostBuffer(stack, hwHitBufferBytes,
+                        VK12.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                hwHitStagingBufs[i] = hb[0]; hwHitStagingAllocs[i] = hb[1]; hwHitMappedPtrs[i] = hb[2];
+            }
         }
         this.imageTransitioned = false;
+        this.framesDispatched = 0L;
+    }
+
+    private long[] create2DImage(MemoryStack stack, int w, int h, int format, int usage) {
+        VkImageCreateInfo imgInfo = VkImageCreateInfo.calloc(stack)
+                .sType$Default()
+                .imageType(VK12.VK_IMAGE_TYPE_2D)
+                .format(format)
+                .mipLevels(1).arrayLayers(1)
+                .samples(VK12.VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK12.VK_IMAGE_TILING_OPTIMAL)
+                .usage(usage)
+                .sharingMode(VK12.VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK12.VK_IMAGE_LAYOUT_UNDEFINED);
+        imgInfo.extent().set(w, h, 1);
+
+        VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
+                .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        LongBuffer pImg = stack.mallocLong(1);
+        PointerBuffer pAlloc = stack.mallocPointer(1);
+        checkVk(Vma.vmaCreateImage(vmaAllocator, imgInfo, allocInfo, pImg, pAlloc, null), "vmaCreateImage(rtRefl)");
+        long img = pImg.get(0);
+        long alloc = pAlloc.get(0);
+
+        VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
+                .sType$Default()
+                .image(img)
+                .viewType(VK12.VK_IMAGE_VIEW_TYPE_2D)
+                .format(format);
+        viewInfo.subresourceRange()
+                .aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1)
+                .baseArrayLayer(0).layerCount(1);
+
+        LongBuffer pView = stack.mallocLong(1);
+        checkVk(VK12.vkCreateImageView(vkDevice, viewInfo, null, pView), "vkCreateImageView(rtRefl)");
+        return new long[] { img, alloc, pView.get(0) };
+    }
+
+    private long[] createHostBuffer(MemoryStack stack, int sizeBytes, int usage, int vmaFlags) {
+        VkBufferCreateInfo bufInfo = VkBufferCreateInfo.calloc(stack)
+                .sType$Default()
+                .size(Math.max(64, sizeBytes))
+                .usage(usage)
+                .sharingMode(VK12.VK_SHARING_MODE_EXCLUSIVE);
+        VmaAllocationCreateInfo vmaAlloc = VmaAllocationCreateInfo.calloc(stack)
+                .usage(Vma.VMA_MEMORY_USAGE_AUTO)
+                .flags(vmaFlags);
+
+        LongBuffer pBuf = stack.mallocLong(1);
+        PointerBuffer pAlloc = stack.mallocPointer(1);
+        VmaAllocationInfo allocInfo = VmaAllocationInfo.calloc(stack);
+        checkVk(Vma.vmaCreateBuffer(vmaAllocator, bufInfo, vmaAlloc, pBuf, pAlloc, allocInfo), "vmaCreateBuffer(rtReflHw)");
+        return new long[] { pBuf.get(0), pAlloc.get(0), allocInfo.pMappedData() };
     }
 
     private void updateDescriptorSet(
@@ -324,12 +434,15 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
             long shRView, long shGView, long shBView, long lpvLinearSamp,
             long c0View, long noiseView,
             long blockAtlasView, long paletteLutView, long voxelPaletteView, long farPaletteView,
-            long outStorageView
+            long outStorageView, long hwHitTexView, long hwRayBuf
     ) {
         VkDescriptorBufferInfo.Buffer uboInfo = VkDescriptorBufferInfo.calloc(1, stack)
                 .buffer(frameUbo).offset(0).range(RaindioUniformManager.FRAME_UBO_SIZE);
 
-        VkDescriptorImageInfo.Buffer imgs = VkDescriptorImageInfo.calloc(20, stack);
+        VkDescriptorBufferInfo.Buffer rayBufInfo = VkDescriptorBufferInfo.calloc(1, stack)
+                .buffer(hwRayBuf).offset(0).range(hwRayBufferBytes);
+
+        VkDescriptorImageInfo.Buffer imgs = VkDescriptorImageInfo.calloc(21, stack);
         imgs.get(0).sampler(nearestSamp).imageView(c1View).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
         imgs.get(1).sampler(linearSamp).imageView(c3View).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
         imgs.get(2).sampler(linearSamp).imageView(c6View).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
@@ -350,8 +463,9 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         imgs.get(17).sampler(voxelNearestSamp).imageView(voxelPaletteView).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
         imgs.get(18).sampler(voxelNearestSamp).imageView(farPaletteView).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
         imgs.get(19).sampler(VK12.VK_NULL_HANDLE).imageView(outStorageView).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
+        imgs.get(20).sampler(nearestSamp).imageView(hwHitTexView).imageLayout(VK12.VK_IMAGE_LAYOUT_GENERAL);
 
-        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(21, stack);
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(23, stack);
         writes.get(0).sType$Default().dstSet(set).dstBinding(0)
                 .descriptorType(VK12.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1).pBufferInfo(uboInfo);
         for (int i = 0; i < 19; i++) {
@@ -362,6 +476,12 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         writes.get(20).sType$Default().dstSet(set).dstBinding(20)
                 .descriptorType(VK12.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
                 .pImageInfo(VkDescriptorImageInfo.create(imgs.address(19), 1));
+        writes.get(21).sType$Default().dstSet(set).dstBinding(21)
+                .descriptorType(VK12.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
+                .pImageInfo(VkDescriptorImageInfo.create(imgs.address(20), 1));
+        writes.get(22).sType$Default().dstSet(set).dstBinding(22)
+                .descriptorType(VK12.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
+                .pBufferInfo(rayBufInfo);
         VK12.vkUpdateDescriptorSets(vkDevice, writes, null);
     }
 
@@ -409,6 +529,24 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
         transitionImage(cmd, stack, image,
                 VK12.VK_IMAGE_LAYOUT_GENERAL, VK12.VK_IMAGE_LAYOUT_GENERAL,
                 VK12.VK_ACCESS_TRANSFER_WRITE_BIT, VK12.VK_ACCESS_SHADER_READ_BIT | VK12.VK_ACCESS_SHADER_WRITE_BIT,
+                VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    private static void clearAndInitImageZero(VkCommandBuffer cmd, MemoryStack stack, long image) {
+        transitionImage(cmd, stack, image,
+                VK12.VK_IMAGE_LAYOUT_UNDEFINED, VK12.VK_IMAGE_LAYOUT_GENERAL,
+                0, VK12.VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK12.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK12.VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkClearColorValue clearVal = VkClearColorValue.calloc(stack);
+        clearVal.float32(0, -1.0f).float32(1, 0.0f).float32(2, 0.0f).float32(3, 0.0f);
+        VkImageSubresourceRange range = VkImageSubresourceRange.calloc(stack)
+                .aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1)
+                .baseArrayLayer(0).layerCount(1);
+        VK12.vkCmdClearColorImage(cmd, image, VK12.VK_IMAGE_LAYOUT_GENERAL, clearVal, range);
+        transitionImage(cmd, stack, image,
+                VK12.VK_IMAGE_LAYOUT_GENERAL, VK12.VK_IMAGE_LAYOUT_GENERAL,
+                VK12.VK_ACCESS_TRANSFER_WRITE_BIT, VK12.VK_ACCESS_SHADER_READ_BIT,
                 VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
 
@@ -463,12 +601,31 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
 
     private void destroyOutputImage() {
         if (vkDevice == null) return;
-        if (outImage != VK12.VK_NULL_HANDLE) VK12.vkDeviceWaitIdle(vkDevice);
+        if (outImage != VK12.VK_NULL_HANDLE || hwHitImage != VK12.VK_NULL_HANDLE) {
+            VK12.vkDeviceWaitIdle(vkDevice);
+        }
         if (outView != VK12.VK_NULL_HANDLE) VK12.vkDestroyImageView(vkDevice, outView, null);
         if (outImage != VK12.VK_NULL_HANDLE) Vma.vmaDestroyImage(vmaAllocator, outImage, outAlloc);
         outImage = outView = VK12.VK_NULL_HANDLE;
         outAlloc = 0L;
+
+        if (hwHitView != VK12.VK_NULL_HANDLE) VK12.vkDestroyImageView(vkDevice, hwHitView, null);
+        if (hwHitImage != VK12.VK_NULL_HANDLE) Vma.vmaDestroyImage(vmaAllocator, hwHitImage, hwHitAlloc);
+        hwHitImage = hwHitView = VK12.VK_NULL_HANDLE;
+        hwHitAlloc = 0L;
+
+        for (int i = 0; i < RING_SIZE; i++) {
+            if (hwRayBufs[i] != VK12.VK_NULL_HANDLE) {
+                Vma.vmaDestroyBuffer(vmaAllocator, hwRayBufs[i], hwRayAllocs[i]);
+                hwRayBufs[i] = VK12.VK_NULL_HANDLE; hwRayAllocs[i] = 0L;
+            }
+            if (hwHitStagingBufs[i] != VK12.VK_NULL_HANDLE) {
+                Vma.vmaDestroyBuffer(vmaAllocator, hwHitStagingBufs[i], hwHitStagingAllocs[i]);
+                hwHitStagingBufs[i] = VK12.VK_NULL_HANDLE; hwHitStagingAllocs[i] = 0L;
+            }
+        }
         imageTransitioned = false;
+        framesDispatched = 0L;
     }
 
     @Override
@@ -482,7 +639,6 @@ public final class RaindioRtReflectionManager implements AutoCloseable {
             if (descriptorPool != VK12.VK_NULL_HANDLE) { VK12.vkDestroyDescriptorPool(vkDevice, descriptorPool, null); descriptorPool = VK12.VK_NULL_HANDLE; }
         }
         initialized = false;
-        outWidth = -1;
-        outHeight = -1;
+        outWidth = outHeight = hwWidth = hwHeight = -1;
     }
 }
