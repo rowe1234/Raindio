@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "com.raindio.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ChunkSectionsToRenderAccessor",
+    "GameRendererMixin",
+    "LevelRendererMixin",
+    "ViewAreaAccessor",
+    "VulkanCommandEncoderAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

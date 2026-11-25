@@ -1,0 +1,829 @@
+#version 450
+
+// ============================================================================
+// Raindio Native Vulkan Compute — True Spatiotemporal ReSTIR DI + ReSTIR GI Pass 1 (Temporal)
+//   - Textbook ReSTIR DI (Bitterli et al. 2020):
+//       16x16 Tile Culling -> Streamed RIS over Area-Light Surface Samples ->
+//       1-ray Voxel DDA Visibility Reuse (0.025m tight normal bias, 0.05m tight target stop) ->
+//       Motion-Vector Temporal Reservoir Reuse + Occlusion Verification (eliminates shadow drag)
+//   - Hybrid Ray-Traced ReSTIR GI:
+//       Screen-Space Bounce (2-step binary refinement + backface check) +
+//       16-step 3D Voxel DDA Off-Screen Bounce & Sky Visibility (zero indoor sky-bleed) +
+//       Hit-Position Storage in uCurGiPos for Pass 2 Hemisphere Spatial Reuse
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#include "common/raindio_uniforms.glsl"
+#include "lib/common.glsl"
+#include "lib/projection.glsl"
+
+struct PointLight {
+    vec4 posAndRadius;      // xyz: camera-relative world position, w: effective radius (m)
+    vec4 colorAndIntensity; // rgb: linear physical color, w: radiant intensity
+};
+
+struct EntityBox {
+    vec4 boxMin;
+    vec4 boxMax;
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer PointLightBuffer {
+    ivec4 lightMeta;        // x: activeLightCount (0..512), y: lpvReady (0/1), z: debugMode, w: historyValid (0/1)
+    PointLight lights[512];
+    ivec4 entityMeta;       // x: activeEntityCount (0..64), y: topKEnabled (0/1), z: ddaTaps (1/2/4/8)
+    EntityBox entities[64];
+};
+
+layout(set = 0, binding = 2) uniform sampler2D colortex0;
+layout(set = 0, binding = 3) uniform sampler2D colortex1;
+layout(set = 0, binding = 4) uniform sampler2D colortex2;
+layout(set = 0, binding = 5) uniform sampler2D colortex6;
+layout(set = 0, binding = 6) uniform sampler2D depthtex0;
+layout(set = 0, binding = 7) uniform sampler2D uPrevDiRes;      // Previous frame DI Reservoir: (lightIdx, W, M, packedUV)
+layout(set = 0, binding = 8) uniform sampler2D uPrevGiPos;      // Previous frame GI Sample Pos (xyz: worldRel, w: hitDist)
+layout(set = 0, binding = 9) uniform sampler2D uPrevGiRad;      // Previous frame GI Irradiance (rgb: smooth GI irr, a: M)
+layout(set = 0, binding = 10) uniform sampler2D uPrevGeo;       // Previous frame Geo (rg: octN, b: linZ, a: skyLight)
+layout(set = 0, binding = 11) uniform sampler3D uLpvShR;
+layout(set = 0, binding = 12) uniform sampler3D uLpvShG;
+layout(set = 0, binding = 13) uniform sampler3D uLpvShB;
+layout(set = 0, binding = 14) uniform usampler3D uVoxelMask;
+layout(set = 0, binding = 15) uniform usampler3D uSubVoxelMask;
+
+layout(set = 0, binding = 16, rgba32f) uniform writeonly image2D uCurDiRes;
+layout(set = 0, binding = 17, rgba32f) uniform writeonly image2D uCurGiPos;
+layout(set = 0, binding = 18, rgba16f) uniform writeonly image2D uCurGiRad;
+layout(set = 0, binding = 19, rgba16f) uniform writeonly image2D uCurGeo;
+
+const vec3 STAINED_GLASS_TINT[16] = vec3[16](
+    vec3(0.92, 0.92, 0.92), vec3(0.95, 0.48, 0.14), vec3(0.82, 0.28, 0.80), vec3(0.32, 0.72, 0.96),
+    vec3(0.96, 0.86, 0.20), vec3(0.46, 0.86, 0.18), vec3(0.96, 0.56, 0.72), vec3(0.38, 0.40, 0.44),
+    vec3(0.66, 0.68, 0.70), vec3(0.16, 0.68, 0.74), vec3(0.56, 0.22, 0.82), vec3(0.20, 0.34, 0.92),
+    vec3(0.52, 0.34, 0.18), vec3(0.26, 0.62, 0.22), vec3(0.90, 0.18, 0.16), vec3(0.14, 0.14, 0.16)
+);
+
+shared uint sMinZBits;
+shared uint sMaxZBits;
+shared uint sTileLightCount;
+shared uint sTileLights[512];
+
+uint pcgNext(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rand01(inout uint state) {
+    return float(pcgNext(state)) * (1.0 / 4294967296.0);
+}
+
+uint hashLightCell(ivec3 cell) {
+    uint h = uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u;
+    return (h ^ (h >> 11u)) & 511u; // 9-bit world-position fingerprint
+}
+
+float packUVAndHash(vec2 uv01, uint lightHash) {
+    uint qx = uint(clamp(floor(uv01.x * 127.0 + 0.5), 0.0, 127.0));
+    uint qy = uint(clamp(floor(uv01.y * 127.0 + 0.5), 0.0, 127.0));
+    uint h9 = lightHash & 511u;
+    // 7 + 7 + 9 = 23 bits -> exact integer in FP32 with zero NaN/Inf risk
+    return float((h9 << 14u) | (qy << 7u) | qx);
+}
+
+vec2 unpackUV(float packed, out uint lightHash) {
+    uint p = uint(clamp(packed + 0.5, 0.0, 8388607.0));
+    lightHash = (p >> 14u) & 511u;
+    return vec2(float(p & 127u) / 127.0, float((p >> 7u) & 127u) / 127.0);
+}
+
+float plD_GGX(float NdotH, float rough) {
+    float a = rough * rough;
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * denom * denom, 1e-5);
+}
+
+float plG_Smith(float NdotV, float NdotL, float rough) {
+    float k = (rough + 1.0);
+    k = (k * k) * 0.125;
+    float gv = NdotV / (NdotV * (1.0 - k) + k);
+    float gl = NdotL / (NdotL * (1.0 - k) + k);
+    return gv * gl;
+}
+
+vec3 plF_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 sampleSkyLUT(vec3 dir) {
+    vec3 d = normalize(dir);
+    float u = fract(atan(d.z, d.x) / (2.0 * PI) + 0.5);
+    float sy = clamp(d.y, -1.0, 1.0);
+    float v = clamp(sign(sy) * sqrt(abs(sy)) * 0.5 + 0.5, 0.004, 0.996);
+    return textureLod(colortex6, vec2(u, v), 0.0).rgb;
+}
+
+vec3 computeAreaLightTarget(vec3 worldPosLight, float lightRadius, vec3 worldPosStart, vec2 uv01) {
+    vec3 baseDelta = worldPosLight - worldPosStart;
+    float baseDist = length(baseDelta);
+    if (baseDist < 0.45) return worldPosLight;
+
+    ivec3 targetCell = ivec3(floor(worldPosLight));
+    vec3 baseDir = baseDelta / baseDist;
+    vec3 upRef = (abs(baseDir.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tAxis = normalize(cross(upRef, baseDir));
+    vec3 bAxis = cross(baseDir, tAxis);
+
+    float diskRadius = clamp(lightRadius * 0.018, 0.18, 0.28) * smoothstep(0.45, 1.8, baseDist);
+    float r = sqrt(clamp(uv01.x, 0.0, 1.0)) * diskRadius;
+    float phi = uv01.y * 6.2831853;
+    vec3 pt = worldPosLight + (tAxis * cos(phi) + bAxis * sin(phi)) * r;
+    return clamp(pt, vec3(targetCell) + vec3(0.06), vec3(targetCell) + vec3(0.94));
+}
+
+bool hitSubVoxelCell(ivec3 cell, vec3 startP, vec3 rayDir, vec3 invDir, ivec3 stepDir, float tEnter, float tExit) {
+    if (tExit <= tEnter) return false;
+    uvec2 bits = texelFetch(uSubVoxelMask, cell & 63, 0).rg;
+    if ((bits.x | bits.y) == 0u) return false;
+
+    vec3 localP = clamp((startP + rayDir * (tEnter + 0.002) - vec3(cell)) * 4.0, vec3(0.0), vec3(3.999));
+    ivec3 sc = ivec3(floor(localP));
+    vec3 nextSub = vec3(sc) + vec3(
+        rayDir.x >= 0.0 ? 1.0 : 0.0,
+        rayDir.y >= 0.0 ? 1.0 : 0.0,
+        rayDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 stMax = abs(nextSub - localP) * invDir;
+    float maxSubT = (tExit - tEnter) * 4.0;
+    float stCurr = 0.0;
+
+    for (int k = 0; k < 12; k++) {
+        uint bitIdx = uint((sc.y << 4) | (sc.z << 2) | sc.x);
+        bool occupied = (bitIdx < 32u)
+            ? ((bits.x & (1u << bitIdx)) != 0u)
+            : ((bits.y & (1u << (bitIdx - 32u))) != 0u);
+        if (occupied) return true;
+
+        if (stMax.x < stMax.y && stMax.x < stMax.z) {
+            stCurr = stMax.x; stMax.x += invDir.x; sc.x += stepDir.x;
+        } else if (stMax.y < stMax.z) {
+            stCurr = stMax.y; stMax.y += invDir.y; sc.y += stepDir.y;
+        } else {
+            stCurr = stMax.z; stMax.z += invDir.z; sc.z += stepDir.z;
+        }
+        if (stCurr >= maxSubT || any(lessThan(sc, ivec3(0))) || any(greaterThan(sc, ivec3(3)))) break;
+    }
+    return false;
+}
+
+bool hitDynamicEntity(vec3 startRel, vec3 targetRel, vec3 rayDir, float maxDist, int entityCount) {
+    if (entityCount <= 0) return false;
+    vec3 rayMin = min(startRel, targetRel);
+    vec3 rayMax = max(startRel, targetRel);
+    vec3 invSigned = vec3(
+        abs(rayDir.x) > 1e-5 ? (1.0 / rayDir.x) : 1e6,
+        abs(rayDir.y) > 1e-5 ? (1.0 / rayDir.y) : 1e6,
+        abs(rayDir.z) > 1e-5 ? (1.0 / rayDir.z) : 1e6
+    );
+    for (int e = 0; e < entityCount; e++) {
+        vec3 bMin = entities[e].boxMin.xyz;
+        vec3 bMax = entities[e].boxMax.xyz;
+        if (any(greaterThan(bMin, rayMax)) || any(lessThan(bMax, rayMin))) continue;
+        if (all(greaterThanEqual(startRel, bMin - vec3(0.10))) && all(lessThanEqual(startRel, bMax + vec3(0.10)))) continue;
+        vec3 t0 = (bMin - startRel) * invSigned;
+        vec3 t1 = (bMax - startRel) * invSigned;
+        vec3 tMin = min(t0, t1);
+        vec3 tMax = max(t0, t1);
+        float tEnter = max(max(tMin.x, tMin.y), tMin.z);
+        float tExit  = min(min(tMax.x, tMax.y), tMax.z);
+        if (tExit >= max(tEnter, 0.06) && tEnter < maxDist) return true;
+    }
+    return false;
+}
+
+vec3 traceVisibilityToPoint(vec3 worldPosStart, vec3 targetPos, ivec3 targetCell, vec3 worldN) {
+    // Tight 0.025m normal bias keeps shadows glued to block edges with zero detachment;
+    // only push an extra 0.055m if Reverse-Z depth precision lands startCell inside a solid voxel.
+    vec3 startP = worldPosStart + worldN * 0.025;
+    ivec3 startCell = ivec3(floor(startP));
+    if ((texelFetch(uVoxelMask, startCell & 63, 0).r & 0x7Fu) == 1u) {
+        startP += worldN * 0.055;
+    }
+
+    vec3 relStart = abs(startP - cameraPosition);
+    vec3 relLight = abs(targetPos - cameraPosition);
+    if (max(relStart.x, max(relStart.y, relStart.z)) > 30.0 ||
+        max(relLight.x, max(relLight.y, relLight.z)) > 30.0) {
+        return vec3(1.0);
+    }
+
+    vec3 delta = targetPos - startP;
+    float dist = length(delta);
+    if (dist < 0.35) return vec3(1.0);
+    vec3 rayDir = delta / dist;
+    // 0.45m target stop matches the 0.5m half-size of 1m^3 emissive blocks so recessed floor/wall lights
+    // behind stained glass don't self-clip against adjacent solid recess rims at grazing angles.
+    float maxT = max(dist - 0.45, 0.0);
+
+    int entityCount = clamp(entityMeta.x, 0, 64);
+    if (entityCount > 0 && hitDynamicEntity(startP - cameraPosition, targetPos - cameraPosition, rayDir, max(dist - 0.18, 0.0), entityCount)) {
+        return vec3(0.0);
+    }
+
+    ivec3 cell = ivec3(floor(startP));
+    ivec3 stepDir = ivec3(sign(rayDir));
+    vec3 invDir = vec3(
+        abs(rayDir.x) > 1e-5 ? (1.0 / abs(rayDir.x)) : 1e6,
+        abs(rayDir.y) > 1e-5 ? (1.0 / abs(rayDir.y)) : 1e6,
+        abs(rayDir.z) > 1e-5 ? (1.0 / abs(rayDir.z)) : 1e6
+    );
+    vec3 nextBound = vec3(cell) + vec3(
+        rayDir.x >= 0.0 ? 1.0 : 0.0,
+        rayDir.y >= 0.0 ? 1.0 : 0.0,
+        rayDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 tMax = abs(nextBound - startP) * invDir;
+
+    uint startMask = texelFetch(uVoxelMask, cell & 63, 0).r & 0x7Fu;
+    if (startMask == 18u && cell != targetCell) {
+        float firstExit = min(min(tMax.x, min(tMax.y, tMax.z)), maxT);
+        if (firstExit > 0.02 && hitSubVoxelCell(cell, startP, rayDir, invDir, stepDir, 0.02, firstExit)) {
+            return vec3(0.0);
+        }
+    }
+    if (cell == targetCell) return vec3(1.0);
+
+    vec3 transmittance = vec3(1.0);
+    for (int s = 0; s < 40; s++) {
+        float tCurr;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            tCurr = tMax.x; tMax.x += invDir.x; cell.x += stepDir.x;
+        } else if (tMax.y < tMax.z) {
+            tCurr = tMax.y; tMax.y += invDir.y; cell.y += stepDir.y;
+        } else {
+            tCurr = tMax.z; tMax.z += invDir.z; cell.z += stepDir.z;
+        }
+        if (tCurr >= maxT || cell == targetCell) break;
+
+        uint mask = texelFetch(uVoxelMask, cell & 63, 0).r & 0x7Fu;
+        if (mask == 1u) return vec3(0.0);
+        if (mask == 18u) {
+            float tExit = min(min(tMax.x, min(tMax.y, tMax.z)), maxT);
+            if (hitSubVoxelCell(cell, startP, rayDir, invDir, stepDir, tCurr, tExit)) return vec3(0.0);
+        } else if (mask >= 2u && mask <= 17u) {
+            transmittance *= STAINED_GLASS_TINT[mask - 2u];
+        }
+    }
+    return transmittance;
+}
+
+float evalTargetPdf(
+    int lIdx, vec2 uv01, vec3 worldRel, vec3 worldPos, vec3 worldN, vec3 worldViewDir,
+    vec3 pureAlbedo, vec3 F0, float roughness, float NdotV,
+    float pbrBrightMask, float rainWet, bool isWater, bool isGlass
+) {
+    if (lIdx < 0) return 0.0;
+    vec4 pr = lights[lIdx].posAndRadius;
+    vec4 ci = lights[lIdx].colorAndIntensity;
+    vec3 targetWorld = computeAreaLightTarget(pr.xyz + cameraPosition, max(pr.w, 0.5), worldPos, uv01);
+    vec3 toLight = (targetWorld - cameraPosition) - worldRel;
+    float distSq = dot(toLight, toLight);
+    float radius = max(pr.w, 0.5);
+    if (distSq >= radius * radius) return 0.0;
+
+    float dist = sqrt(max(distSq, 1e-4));
+    vec3 L = toLight / dist;
+    float nearWrap = 0.55 * (1.0 - smoothstep(0.55, 1.95, dist));
+    float rawNdotL = dot(worldN, L);
+    float NdotL = clamp((rawNdotL + nearWrap) / (1.0 + nearWrap), 0.0, 1.0);
+    if (NdotL <= 0.001) return 0.0;
+
+    float u = dist / radius;
+    float u2 = u * u;
+    float win = max(0.0, 1.0 - u2 * u2);
+    win *= win;
+    float atten = win / (1.0 + distSq * 0.85);
+    vec3 radiance = ci.rgb * (ci.w * atten);
+
+    vec3 H = normalize(L + worldViewDir);
+    float NdotH = max(dot(worldN, H), 0.0);
+    float VdotH = max(dot(worldViewDir, H), 0.0);
+    float areaRough = clamp(roughness + 0.16 / max(dist, 0.35), roughness, 0.98);
+    float D = plD_GGX(NdotH, areaRough);
+    float G = plG_Smith(NdotV, NdotL, areaRough);
+    vec3 F = plF_Schlick(VdotH, F0);
+    vec3 spec = min((D * G * F) / max(4.0 * NdotV * NdotL, 0.001), isWater ? vec3(3.5) : vec3(1.4));
+
+    vec3 contrib;
+    if (isWater) {
+        contrib = (pureAlbedo * 0.10 + spec * 0.85) * radiance * NdotL;
+    } else {
+        vec3 kD = vec3(1.0) - F;
+        float specWeight = isGlass ? 0.75 : max(pbrBrightMask * 0.70, rainWet * 0.80);
+        contrib = (pureAlbedo * kD * (1.0 / PI) * 2.2 + spec * specWeight) * radiance * NdotL;
+    }
+    return luminance(contrib);
+}
+
+vec3 sampleCosineHemisphere(vec3 N, float u1, float u2) {
+    float r = sqrt(u1);
+    float phi = 6.2831853 * u2;
+    vec3 up = (abs(N.y) < 0.95) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    float z = sqrt(max(0.0, 1.0 - u1));
+    return normalize(T * (r * cos(phi)) + B * (r * sin(phi)) + N * z);
+}
+
+vec3 sampleLpvAtPos(vec3 sampleWorldPos, vec3 evalDir) {
+    vec3 absRel = abs(sampleWorldPos - cameraPosition);
+    float maxAxis = max(absRel.x, max(absRel.y, absRel.z));
+    float lpvFade = 1.0 - smoothstep(23.0, 30.0, maxAxis);
+    if (lpvFade <= 0.005) return vec3(0.0);
+
+    vec3 lpvUV = fract(sampleWorldPos / 64.0);
+    vec4 shR = textureLod(uLpvShR, lpvUV, 0.0);
+    vec4 shG = textureLod(uLpvShG, lpvUV, 0.0);
+    vec4 shB = textureLod(uLpvShB, lpvUV, 0.0);
+    if (any(isnan(shR)) || any(isinf(shR))) shR = vec4(0.0);
+    if (any(isnan(shG)) || any(isinf(shG))) shG = vec4(0.0);
+    if (any(isnan(shB)) || any(isinf(shB))) shB = vec4(0.0);
+
+    vec4 shEval = vec4(0.88622693, -1.02332671 * evalDir.y, -1.02332671 * evalDir.z, -1.02332671 * evalDir.x);
+    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), vec3(0.0));
+    irr = irr / (vec3(1.0) + irr * 0.14);
+    return irr * lpvFade;
+}
+
+vec3 sampleLpvFallback(vec3 worldPos, vec3 worldRel, vec3 worldN) {
+    vec3 airPos = worldPos + worldN * 0.52;
+    ivec3 airCell = ivec3(floor(airPos));
+    if ((texelFetch(uVoxelMask, airCell & 63, 0).r & 0x7Fu) == 1u) {
+        airPos = worldPos + worldN * 0.16;
+        airCell = ivec3(floor(airPos));
+    }
+    if ((texelFetch(uVoxelMask, airCell & 63, 0).r & 0x7Fu) == 1u) return vec3(0.0);
+    return sampleLpvAtPos(airPos, worldN);
+}
+
+// Screen-space 1-bounce GI ray with 2-step binary refinement and backface rejection
+bool traceScreenSpaceGiBounce(vec3 startWorldRel, vec3 bounceDirWorld, float jitter, ivec2 outSize, out vec3 hitWorldRel, out vec3 hitRadiance) {
+    vec3 startVS = (gbufferModelView * vec4(startWorldRel, 1.0)).xyz;
+    vec3 dirVS = normalize((gbufferModelView * vec4(bounceDirWorld, 0.0)).xyz);
+
+    float prevT = 0.0;
+    float t = 0.35 + jitter * 0.40;
+    float stepScale = 1.38;
+    vec2 fSize = vec2(outSize);
+
+    for (int i = 0; i < 14; i++) {
+        vec3 sampleVS = startVS + dirVS * t;
+        if (-sampleVS.z < 0.15) break;
+
+        vec4 clip = gbufferProjection * vec4(sampleVS, 1.0);
+        if (clip.w <= 1e-4) break;
+        vec3 ndc = clip.xyz / clip.w;
+        vec2 suv = ndc.xy * 0.5 + 0.5;
+        if (suv.x < 0.008 || suv.x > 0.992 || suv.y < 0.008 || suv.y > 0.992) break;
+
+        float sceneDepth = textureLod(depthtex0, suv, 0.0).r;
+        if (isSceneDepth(sceneDepth)) {
+            float sceneLinZ = linearizeDepth(sceneDepth);
+            float rayLinZ = -sampleVS.z;
+            float thickness = clamp(0.28 + t * 0.14, 0.28, 3.2);
+            if (rayLinZ > sceneLinZ + 0.04 && rayLinZ < sceneLinZ + thickness) {
+                // 2-step binary refinement for tighter hit localization
+                float lo = prevT;
+                float hi = t;
+                vec2 bestUV = suv;
+                float bestDepth = sceneDepth;
+                for (int b = 0; b < 2; b++) {
+                    float midT = 0.5 * (lo + hi);
+                    vec3 midVS = startVS + dirVS * midT;
+                    vec4 midClip = gbufferProjection * vec4(midVS, 1.0);
+                    if (midClip.w <= 1e-4) break;
+                    vec2 midUV = (midClip.xy / midClip.w) * 0.5 + 0.5;
+                    if (midUV.x < 0.004 || midUV.x > 0.996 || midUV.y < 0.004 || midUV.y > 0.996) break;
+                    float midDepth = textureLod(depthtex0, midUV, 0.0).r;
+                    if (isSceneDepth(midDepth) && (-midVS.z) > linearizeDepth(midDepth) + 0.03) {
+                        hi = midT;
+                        bestUV = midUV;
+                        bestDepth = midDepth;
+                    } else {
+                        lo = midT;
+                    }
+                }
+
+                ivec2 hitPx = clamp(ivec2(bestUV * fSize), ivec2(0), outSize - ivec2(1));
+                vec3 hitN = octDecode(texelFetch(colortex1, hitPx, 0).rg);
+                // Reject backface hits on thin foreground pillars/walls to avoid false GI halos
+                if (dot(hitN, bounceDirWorld) > 0.35) {
+                    prevT = t;
+                    t *= stepScale;
+                    if (t > 56.0) break;
+                    continue;
+                }
+
+                vec3 hitVS = ScreenToView(bestUV, bestDepth);
+                hitWorldRel = (gbufferModelViewInverse * vec4(hitVS, 1.0)).xyz;
+                vec3 litHit = texelFetch(colortex0, hitPx, 0).rgb;
+                float l = luminance(litHit);
+                hitRadiance = (l > 2.5) ? (litHit * (2.5 / l)) : max(litHit, vec3(0.0));
+                return true;
+            }
+        }
+        prevT = t;
+        t *= stepScale;
+        if (t > 56.0) break;
+    }
+    return false;
+}
+
+// 16-step 3D Voxel DDA off-screen GI fallback:
+//   - Hits opaque off-screen walls -> samples LPV bounce at hit air cell (zero indoor sky-bleed!)
+//   - Passes through stained glass -> tints transmitted sky/bounce radiance
+//   - Escapes unoccluded -> true ray-traced sky visibility
+void traceVoxelGiBounce(
+    vec3 worldPos, vec3 worldRel, vec3 bounceDir, vec3 worldN, float skyLight, bool lpvReady,
+    out vec3 outHitWorldRel, out vec3 outRad
+) {
+    vec3 startP = worldPos + worldN * 0.08;
+    vec3 absStart = abs(startP - cameraPosition);
+    if (!lpvReady || max(absStart.x, max(absStart.y, absStart.z)) > 29.0) {
+        outHitWorldRel = worldRel + bounceDir * 12.0;
+        vec3 skyB = sampleSkyLUT(bounceDir) * (smoothstep(0.08, 0.85, skyLight) * 0.18);
+        outRad = clamp(skyB, vec3(0.0), vec3(4.0));
+        return;
+    }
+
+    ivec3 cell = ivec3(floor(startP));
+    ivec3 prevAirCell = cell;
+    ivec3 stepDir = ivec3(sign(bounceDir));
+    vec3 invDir = vec3(
+        abs(bounceDir.x) > 1e-5 ? (1.0 / abs(bounceDir.x)) : 1e6,
+        abs(bounceDir.y) > 1e-5 ? (1.0 / abs(bounceDir.y)) : 1e6,
+        abs(bounceDir.z) > 1e-5 ? (1.0 / abs(bounceDir.z)) : 1e6
+    );
+    vec3 nextBound = vec3(cell) + vec3(
+        bounceDir.x >= 0.0 ? 1.0 : 0.0,
+        bounceDir.y >= 0.0 ? 1.0 : 0.0,
+        bounceDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 tMax = abs(nextBound - startP) * invDir;
+
+    vec3 transmittance = vec3(1.0);
+    bool hitSolid = false;
+
+    for (int s = 0; s < 16; s++) {
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            tMax.x += invDir.x; cell.x += stepDir.x;
+        } else if (tMax.y < tMax.z) {
+            tMax.y += invDir.y; cell.y += stepDir.y;
+        } else {
+            tMax.z += invDir.z; cell.z += stepDir.z;
+        }
+
+        vec3 cellRel = (vec3(cell) + 0.5) - cameraPosition;
+        if (max(abs(cellRel.x), max(abs(cellRel.y), abs(cellRel.z))) > 30.0) break;
+
+        uint mask = texelFetch(uVoxelMask, cell & 63, 0).r & 0x7Fu;
+        if (mask == 1u) {
+            hitSolid = true;
+            break;
+        } else if (mask >= 2u && mask <= 17u) {
+            transmittance *= STAINED_GLASS_TINT[mask - 2u];
+        }
+        prevAirCell = cell;
+    }
+
+    if (hitSolid) {
+        outHitWorldRel = (vec3(cell) + 0.5) - cameraPosition;
+        vec3 hitAirWorld = vec3(prevAirCell) + 0.5;
+        vec3 lpvHit = sampleLpvAtPos(hitAirWorld, -bounceDir);
+        vec3 lpvLocal = sampleLpvFallback(worldPos, worldRel, worldN);
+        outRad = clamp(mix(lpvLocal, lpvHit, 0.55) * transmittance * 1.10, vec3(0.0), vec3(4.0));
+    } else {
+        outHitWorldRel = worldRel + bounceDir * 16.0;
+        vec3 lpvBounce = sampleLpvFallback(worldPos, worldRel, worldN);
+        vec3 skyBounce = sampleSkyLUT(bounceDir) * transmittance * (smoothstep(0.06, 0.85, skyLight) * 0.20);
+        outRad = clamp(lpvBounce * 0.90 + skyBounce, vec3(0.0), vec3(4.0));
+    }
+}
+
+void main() {
+    ivec2 outSize = imageSize(uCurDiRes);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    uint lid = gl_LocalInvocationIndex;
+
+    int totalLights = clamp(lightMeta.x, 0, 512);
+    bool lpvReady = (lightMeta.y != 0);
+    bool historyValid = (lightMeta.w != 0);
+    bool useFastRis = (entityMeta.y != 0);
+    int ddaTaps = clamp(entityMeta.z, 1, 8);
+
+    bool inBounds = (gid.x < outSize.x && gid.y < outSize.y);
+    vec2 uv = (vec2(gid) + 0.5) / vec2(max(outSize, ivec2(1)));
+    float rawDepth = inBounds ? textureLod(depthtex0, uv, 0.0).r : 0.0;
+    bool isScene = inBounds && isSceneDepth(rawDepth);
+    vec2 unjitteredUV = clamp(uv - taaJitter * 0.5, vec2(0.001), vec2(0.999));
+    vec3 viewPos = isScene ? ScreenToView(unjitteredUV, rawDepth) : vec3(0.0);
+    float linZ = isScene ? max(-viewPos.z, 0.05) : 0.0;
+
+    // ==================== 16x16 Tile Culling -> Compact Active Light List ====================
+    if (lid == 0u) {
+        sMinZBits = 0x7F7FFFFFu;
+        sMaxZBits = 0u;
+        sTileLightCount = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    if (isScene) {
+        uint zBits = floatBitsToUint(linZ);
+        atomicMin(sMinZBits, zBits);
+        atomicMax(sMaxZBits, zBits);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    if (sMaxZBits > 0u && totalLights > 0) {
+        float tileMinZ = uintBitsToFloat(sMinZBits);
+        float tileMaxZ = uintBitsToFloat(sMaxZBits);
+
+        vec2 invSize = 1.0 / vec2(max(outSize, ivec2(1)));
+        vec2 tileUVMin = vec2(gl_WorkGroupID.xy * 16u) * invSize;
+        vec2 tileUVMax = min(vec2((gl_WorkGroupID.xy + 1u) * 16u) * invSize, vec2(1.0));
+        vec2 ndcMin = tileUVMin * 2.0 - 1.0;
+        vec2 ndcMax = tileUVMax * 2.0 - 1.0;
+
+        vec2 invProj = vec2(gbufferProjectionInverse[0][0], gbufferProjectionInverse[1][1]);
+        vec2 c0 = ndcMin * invProj;
+        vec2 c1 = ndcMax * invProj;
+        float xLeft  = min(c0.x, c1.x);
+        float xRight = max(c0.x, c1.x);
+        float yBot   = min(c0.y, c1.y);
+        float yTop   = max(c0.y, c1.y);
+
+        vec3 nLeft  = normalize(vec3( 1.0,  0.0,  xLeft));
+        vec3 nRight = normalize(vec3(-1.0,  0.0, -xRight));
+        vec3 nBot   = normalize(vec3( 0.0,  1.0,  yBot));
+        vec3 nTop   = normalize(vec3( 0.0, -1.0, -yTop));
+
+        for (uint lIdx = lid; lIdx < uint(totalLights); lIdx += 256u) {
+            vec4 pr = lights[lIdx].posAndRadius;
+            vec3 lVS = (gbufferModelView * vec4(pr.xyz, 1.0)).xyz;
+            float r = pr.w;
+            float lDepth = -lVS.z;
+
+            if (lDepth + r >= tileMinZ && lDepth - r <= tileMaxZ
+                && dot(lVS, nLeft)  >= -r
+                && dot(lVS, nRight) >= -r
+                && dot(lVS, nBot)   >= -r
+                && dot(lVS, nTop)   >= -r) {
+                uint slot = atomicAdd(sTileLightCount, 1u);
+                if (slot < 512u) {
+                    sTileLights[slot] = lIdx;
+                }
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+
+    if (!inBounds) return;
+    if (!isScene) {
+        imageStore(uCurDiRes, gid, vec4(-1.0, 0.0, 0.0, 0.0));
+        imageStore(uCurGiPos, gid, vec4(0.0));
+        imageStore(uCurGiRad, gid, vec4(0.0));
+        imageStore(uCurGeo,   gid, vec4(0.5, 0.5, 0.0, 0.0));
+        return;
+    }
+
+    vec4 c1 = texelFetch(colortex1, gid, 0);
+    int blockId = int(c1.z * 255.0 + 0.5);
+    bool isWater = isMatWater(blockId);
+    bool isGlass = isMatTranslucentNonWater(blockId);
+    vec3 worldN = octDecode(c1.rg);
+    float skyLight = c1.a;
+    vec3 worldRel = (gbufferModelViewInverse * vec4(viewPos, 1.0)).xyz;
+    vec3 worldPos = worldRel + cameraPosition;
+    vec3 worldViewDir = normalize(-worldRel);
+
+    vec4 c2 = texelFetch(colortex2, gid, 0);
+    vec3 pureAlbedo = isWater ? vec3(0.04, 0.14, 0.13) : ((c2.a > 0.5) ? clamp(c2.rgb, vec3(0.02), vec3(1.0)) : vec3(0.50));
+    float rainWet = isWater ? 0.0 : (saturate(rainStrength) * smoothstep(0.50, 0.90, skyLight) * clamp(worldN.y * 0.7 + 0.3, 0.0, 1.0));
+    float peakAlb = max(pureAlbedo.r, max(pureAlbedo.g, pureAlbedo.b));
+    float albLum = luminance(pureAlbedo);
+    float pbrBrightMask = isWater ? 0.0 : smoothstep(0.38, 0.78, max(albLum, peakAlb * 0.92));
+    float roughness = isWater ? 0.12 : (isGlass ? 0.08 : mix(mix(0.94, 0.18, pbrBrightMask), 0.14, rainWet));
+    vec3 highlightF0 = mix(vec3(0.04), mix(vec3(0.14), pureAlbedo * 0.65 + vec3(0.18), 0.65), pbrBrightMask);
+    vec3 F0 = isWater ? vec3(0.02) : (isGlass ? vec3(0.06) : mix(highlightF0, vec3(0.06), rainWet));
+    float NdotV = max(dot(worldN, worldViewDir), 0.001);
+
+    imageStore(uCurGeo, gid, vec4(c1.rg, linZ, skyLight));
+
+    uint rng = uint(gid.x) * 1973u + uint(gid.y) * 9277u + uint(frameCounter & 65535) * 26699u + 911u;
+    pcgNext(rng);
+
+    // ==================== Exact Motion-Vector Reprojection ====================
+    bool prevMatch = false;
+    ivec2 prevPx = ivec2(0);
+    float motionPx = 0.0;
+    vec3 camDelta = cameraPosition - previousCameraPosition;
+    bool teleported = (length(camDelta) > 10.0);
+
+    if (historyValid && !teleported) {
+        vec3 prevWorldRel = worldRel + camDelta;
+        vec4 prevViewPos = gbufferPreviousModelView * vec4(prevWorldRel, 1.0);
+        if (prevViewPos.z < -0.05) {
+            float expectedPrevZ = -prevViewPos.z;
+            vec4 prevClip = gbufferPreviousProjection * prevViewPos;
+            if (prevClip.w > 1e-4) {
+                vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+                if (prevUV.x > 0.004 && prevUV.x < 0.996 && prevUV.y > 0.004 && prevUV.y < 0.996) {
+                    vec2 deltaUV = (unjitteredUV - prevUV) * vec2(outSize);
+                    motionPx = length(deltaUV);
+                    prevPx = clamp(ivec2(floor(prevUV * vec2(outSize))), ivec2(0), outSize - ivec2(1));
+                    vec4 prevGeo = texelFetch(uPrevGeo, prevPx, 0);
+                    float storedPrevZ = prevGeo.b;
+                    vec3 prevN = octDecode(prevGeo.rg);
+                    float relZErr = abs(storedPrevZ - expectedPrevZ) / max(expectedPrevZ, 0.25);
+                    if (storedPrevZ > 0.05 && relZErr < 0.06 && dot(prevN, worldN) > 0.92) {
+                        prevMatch = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== Stage A: True ReSTIR DI (Streamed RIS + 1-Ray Visibility + Temporal Reuse) ====================
+    int tileCount = int(min(sTileLightCount, 512u));
+    int risMaxCandidates = useFastRis ? (ddaTaps >= 4 ? 24 : 16) : 32;
+
+    int initLightIdx = -1;
+    vec2 initUV = vec2(0.5);
+    float initPHat = 0.0;
+    float initWSum = 0.0;
+
+    // Spatio-temporal blue-noise base (IGN + golden-ratio R2) dramatically lowers multi-light variance
+    float bnBase = interleavedGradientNoise(vec2(gid));
+    float fShift = fract(float(frameCounter & 1023) * 0.61803398875);
+
+    if (tileCount > 0) {
+        bool fullScan = (tileCount <= risMaxCandidates);
+        int numCand = fullScan ? tileCount : risMaxCandidates;
+        float invSourcePdf = fullScan ? 1.0 : (float(tileCount) / float(numCand));
+
+        for (int c = 0; c < numCand; c++) {
+            int lIdx = fullScan
+                ? int(sTileLights[c])
+                : int(sTileLights[pcgNext(rng) % uint(tileCount)]);
+            vec2 candUV = vec2(
+                fract(bnBase + fShift + float(c) * 0.75487766),
+                fract(bnBase * 1.6180339 + fShift * 1.3247179 + float(c) * 0.56984029)
+            );
+            float pHat = evalTargetPdf(
+                lIdx, candUV, worldRel, worldPos, worldN, worldViewDir,
+                pureAlbedo, F0, roughness, NdotV, pbrBrightMask, rainWet, isWater, isGlass
+            );
+            float w = pHat * invSourcePdf;
+            if (w > 0.0) {
+                initWSum += w;
+                if (rand01(rng) * initWSum < w) {
+                    initLightIdx = lIdx;
+                    initUV = candUV;
+                    initPHat = pHat;
+                }
+            }
+        }
+    }
+
+    // 1-ray visibility check on winning initial candidate (ReSTIR DI visibility reuse)
+    float initW = 0.0;
+    float initM = (tileCount > 0) ? 1.0 : 0.0;
+    if (initLightIdx >= 0 && initPHat > 1e-6) {
+        vec4 pr = lights[initLightIdx].posAndRadius;
+        vec3 lightWorld = pr.xyz + cameraPosition;
+        vec3 targetWorld = computeAreaLightTarget(lightWorld, max(pr.w, 0.5), worldPos, initUV);
+        vec3 vis = lpvReady ? traceVisibilityToPoint(worldPos, targetWorld, ivec3(floor(lightWorld)), worldN) : vec3(1.0);
+        if (max(vis.r, max(vis.g, vis.b)) > 0.001) {
+            initW = initWSum / initPHat;
+        }
+    }
+
+    // Temporal Reservoir Combination (R_init + R_prev) with 9-bit world-position hash validation
+    int finalLightIdx = initLightIdx;
+    vec2 finalUV = initUV;
+    float finalPHat = initPHat;
+    float combWSum = (initW > 0.0) ? (initPHat * initW * initM) : 0.0;
+    float combM = initM;
+    bool pickedHistory = false;
+
+    if (prevMatch && totalLights > 0) {
+        vec4 prevRes = texelFetch(uPrevDiRes, prevPx, 0);
+        int prevLightIdx = int(floor(prevRes.x + 0.5));
+        float prevW = prevRes.y;
+        float prevM = prevRes.z;
+        if (prevLightIdx >= 0 && prevLightIdx < totalLights && prevM > 0.0 && !isnan(prevW) && !isinf(prevW) && prevW >= 0.0) {
+            uint storedHash;
+            vec2 prevUV = unpackUV(prevRes.w, storedHash);
+            uint curHash = hashLightCell(ivec3(floor(lights[prevLightIdx].posAndRadius.xyz + cameraPosition)));
+            if (curHash == storedHash) {
+                float maxHistM = mix(16.0, 8.0, smoothstep(1.0, 8.0, motionPx));
+                float clampedPrevM = min(prevM, maxHistM);
+                float prevPHat = evalTargetPdf(
+                    prevLightIdx, prevUV, worldRel, worldPos, worldN, worldViewDir,
+                    pureAlbedo, F0, roughness, NdotV, pbrBrightMask, rainWet, isWater, isGlass
+                );
+                float wPrev = prevPHat * prevW * clampedPrevM;
+                combM += clampedPrevM;
+                if (wPrev > 0.0) {
+                    combWSum += wPrev;
+                    if (rand01(rng) * combWSum < wPrev) {
+                        finalLightIdx = prevLightIdx;
+                        finalUV = prevUV;
+                        finalPHat = prevPHat;
+                        pickedHistory = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify visibility when temporal history won (eliminates occluded-reservoir shadow drag on movement/entities)
+    if (pickedHistory && finalLightIdx >= 0 && lpvReady) {
+        vec4 pr = lights[finalLightIdx].posAndRadius;
+        vec3 lightWorld = pr.xyz + cameraPosition;
+        vec3 targetWorld = computeAreaLightTarget(lightWorld, max(pr.w, 0.5), worldPos, finalUV);
+        vec3 hVis = traceVisibilityToPoint(worldPos, targetWorld, ivec3(floor(lightWorld)), worldN);
+        if (max(hVis.r, max(hVis.g, hVis.b)) <= 0.001) {
+            if (initLightIdx >= 0 && initW > 0.0) {
+                finalLightIdx = initLightIdx;
+                finalUV = initUV;
+                finalPHat = initPHat;
+                combWSum = initPHat * initW;
+                combM = 1.0;
+            } else {
+                finalLightIdx = -1;
+                combWSum = 0.0;
+                combM = 1.0;
+            }
+        }
+    }
+
+    float finalW = (finalLightIdx >= 0 && finalPHat > 1e-6 && combM > 0.0)
+        ? clamp(combWSum / (finalPHat * combM), 0.0, 10.0)
+        : 0.0;
+    uint outHash = 0u;
+    if (finalW <= 0.0) {
+        finalLightIdx = -1;
+    } else {
+        outHash = hashLightCell(ivec3(floor(lights[finalLightIdx].posAndRadius.xyz + cameraPosition)));
+    }
+    imageStore(uCurDiRes, gid, vec4(float(finalLightIdx), finalW, combM, packUVAndHash(finalUV, outHash)));
+
+    // ==================== Stage B: Hybrid Screen-Space + 3D Voxel DDA ReSTIR GI ====================
+    int giRays = (ddaTaps >= 4) ? 2 : 1;
+    vec3 giRadSum = vec3(0.0);
+    vec3 bestGiPos = worldRel + worldN * 8.0;
+    float bestGiLum = -1.0;
+
+    for (int r = 0; r < giRays; r++) {
+        float u1 = fract(bnBase + fShift * 1.3247179 + float(r) * 0.5 + rand01(rng) * 0.25);
+        float u2 = fract(bnBase * 1.6180339 + fShift + float(r) * 0.5 + rand01(rng) * 0.25);
+        vec3 bounceDir = sampleCosineHemisphere(worldN, u1, u2);
+
+        vec3 hitPos, hitRad;
+        bool hitSS = traceScreenSpaceGiBounce(worldRel + worldN * 0.10, bounceDir, rand01(rng), outSize, hitPos, hitRad);
+        if (!hitSS) {
+            traceVoxelGiBounce(worldPos, worldRel, bounceDir, worldN, skyLight, lpvReady, hitPos, hitRad);
+        }
+
+        giRadSum += hitRad;
+        float hLum = luminance(hitRad);
+        if (hLum > bestGiLum) {
+            bestGiLum = hLum;
+            bestGiPos = hitPos;
+        }
+    }
+    vec3 giRad = giRadSum * (1.0 / float(giRays));
+    float giHitDist = clamp(length(bestGiPos - worldRel), 0.25, 64.0);
+
+    vec3 smoothGiIrr = giRad;
+    float giM = 1.0;
+
+    if (prevMatch) {
+        vec4 prevGiR = texelFetch(uPrevGiRad, prevPx, 0);
+        if (!any(isnan(prevGiR.rgb)) && !any(isinf(prevGiR.rgb))) {
+            float prevM = clamp(prevGiR.a, 0.0, 10.0);
+            float motionAlpha = smoothstep(0.5, 4.5, motionPx);
+            float alpha = clamp(max(1.0 / (prevM + 1.0), max(0.14, motionAlpha * 0.65)), 0.14, 0.85);
+            smoothGiIrr = mix(prevGiR.rgb, giRad, alpha);
+            giM = min(prevM + 1.0, 10.0);
+        }
+    }
+
+    if (any(isnan(smoothGiIrr)) || any(isinf(smoothGiIrr))) smoothGiIrr = vec3(0.0);
+    imageStore(uCurGiPos, gid, vec4(bestGiPos, giHitDist));
+    imageStore(uCurGiRad, gid, vec4(clamp(smoothGiIrr, vec3(0.0), vec3(6.0)), giM));
+}

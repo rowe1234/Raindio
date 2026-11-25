@@ -1,0 +1,168 @@
+plugins {
+    // Minecraft 26.1+ ships unobfuscated: use net.fabricmc.fabric-loom (not fabric-loom-remap)
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+    id 'maven-publish'
+}
+
+version = "${project.mod_version}+mc${project.minecraft_version}"
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+}
+
+loom {
+    accessWidenerPath = file('src/main/resources/raindio.classtweaker')
+
+    runs {
+        client {
+            client()
+            setConfigName('Raindio Client (26.3 Vulkan)')
+            ideConfigGenerated(true)
+            runDir('run')
+        }
+    }
+}
+
+dependencies {
+    // Minecraft 26.3 is unobfuscated: no mappings dependency; use implementation instead of modImplementation
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+// =============================================================================
+// SPIR-V Auto-Compilation Pipeline (GLSL 450 -> Vulkan / MoltenVK SPIR-V)
+// =============================================================================
+def shaderSourceDir = file('src/main/shaders')
+def shaderOutputDir = layout.buildDirectory.dir('generated/shaders/assets/raindio/shaders/spirv')
+
+def resolveGlslc = {
+    if (project.hasProperty('glslc')) {
+        return project.property('glslc').toString()
+    }
+    def candidates = [
+            '/usr/local/bin/glslc',
+            '/opt/homebrew/bin/glslc',
+            System.getenv('VULKAN_SDK') ? "${System.getenv('VULKAN_SDK')}/bin/glslc" : null
+    ].findAll { it != null }
+    for (String c : candidates) {
+        if (file(c).canExecute()) {
+            return c
+        }
+    }
+    return 'glslc'
+}
+
+tasks.register('compileShaders') {
+    group = 'raindio'
+    description = 'Compiles GLSL 450 Vulkan shaders in src/main/shaders to SPIR-V (.spv) using glslc.'
+
+    inputs.dir(shaderSourceDir).optional()
+    outputs.dir(shaderOutputDir)
+
+    doLast {
+        if (!shaderSourceDir.exists()) {
+            logger.lifecycle('[Raindio] Shader source directory not found: {}', shaderSourceDir)
+            return
+        }
+
+        def glslcBin = resolveGlslc()
+        def outRoot = shaderOutputDir.get().asFile
+        outRoot.mkdirs()
+
+        def shaderFiles = fileTree(shaderSourceDir) {
+            include '**/*.vert', '**/*.frag', '**/*.comp'
+        }.files.sort()
+
+        if (shaderFiles.isEmpty()) {
+            logger.lifecycle('[Raindio] No .vert/.frag/.comp shaders found under {}', shaderSourceDir)
+            return
+        }
+
+        logger.lifecycle('[Raindio] Compiling {} GLSL 450 shader(s) with {}', shaderFiles.size(), glslcBin)
+
+        shaderFiles.each { File src ->
+            def relPath = shaderSourceDir.toPath().relativize(src.toPath()).toString()
+            def outFile = new File(outRoot, "${relPath}.spv")
+            outFile.parentFile.mkdirs()
+
+            def cmd = [
+                    glslcBin,
+                    '--target-env=vulkan1.2',
+                    '--target-spv=spv1.3',
+                    '-O',
+                    '-I', shaderSourceDir.absolutePath,
+                    src.absolutePath,
+                    '-o', outFile.absolutePath
+            ]
+
+            def proc = new ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .start()
+            def output = proc.inputStream.getText('UTF-8')
+            def exitCode = proc.waitFor()
+            if (exitCode != 0) {
+                throw new GradleException("glslc failed for ${relPath} (exit ${exitCode}):\n${output}")
+            }
+        }
+
+        logger.lifecycle('[Raindio] Successfully compiled {} SPIR-V module(s) -> {}', shaderFiles.size(), outRoot)
+    }
+}
+
+sourceSets {
+    main {
+        resources {
+            srcDir(layout.buildDirectory.dir('generated/shaders'))
+        }
+    }
+}
+
+tasks.matching { it.name == 'sourcesJar' }.configureEach {
+    dependsOn(tasks.named('compileShaders'))
+}
+
+tasks.named('processResources') {
+    dependsOn(tasks.named('compileShaders'))
+    inputs.property('version', project.version)
+    inputs.property('minecraft_version', project.minecraft_version)
+    inputs.property('loader_version', project.loader_version)
+
+    from(shaderSourceDir) {
+        into 'assets/raindio/shaders/glsl'
+    }
+
+    filesMatching('fabric.mod.json') {
+        expand(
+                version: project.version,
+                minecraft_version: project.minecraft_version,
+                loader_version: project.loader_version
+        )
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+    from('LICENSE') {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}

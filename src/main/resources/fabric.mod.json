@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "raindio",
+  "version": "${version}",
+  "name": "Raindio Shaders",
+  "description": "Standalone native Vulkan shader pipeline mod for Minecraft 26.3 (ported from Raindio Iris shaderpack).",
+  "authors": [
+    "Rowe"
+  ],
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.raindio.RaindioClientMod"
+    ]
+  },
+  "mixins": [
+    "raindio.mixins.json"
+  ],
+  "accessWidener": "raindio.classtweaker",
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

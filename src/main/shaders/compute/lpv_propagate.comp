@@ -1,0 +1,259 @@
+#version 450
+
+// ============================================================================
+// Raindio Native Vulkan Compute Shader — Unified 64^3 Toroidal Voxel L1 SH-LPV GI
+//   - Point-light emissive injection (uEmissiveTex) + 16-color stained-glass filtration
+//   - Sunlight surface-bounce injection via shadowtex0 + shadowcolor0 (sunlit surfaces
+//     inject colored albedo bounce along their outward normal; enclosed caves stay 0!)
+//   - 6-neighbor L1 SH flux propagation (<0.6ms fixed GPU cost, zero Monte Carlo noise!)
+// ============================================================================
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#include "common/raindio_uniforms.glsl"
+#include "lib/common.glsl"
+
+layout(push_constant) uniform LpvPush {
+    ivec3 lpvOrigin; // Current integer world origin of the 64^3 toroidal grid
+    int stepIndex;   // 0 or 1
+} uPush;
+
+layout(set = 0, binding = 1) uniform usampler3D uVoxelMask;   // R8_UINT: bits 0..6 = 0:air, 1:opaque, 2..17:stained glass; bit 7 = newly wrapped slice
+layout(set = 0, binding = 2) uniform sampler3D  uEmissiveTex; // RGBA8_UNORM: rgb=linear color, a=intensity/4.0
+layout(set = 0, binding = 3) uniform sampler3D  uShRIn;       // RGBA16F: L1 SH Red   (c0, cy, cz, cx)
+layout(set = 0, binding = 4) uniform sampler3D  uShGIn;       // RGBA16F: L1 SH Green (c0, cy, cz, cx)
+layout(set = 0, binding = 5) uniform sampler3D  uShBIn;       // RGBA16F: L1 SH Blue  (c0, cy, cz, cx)
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image3D uShROut;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image3D uShGOut;
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image3D uShBOut;
+layout(set = 0, binding = 9) uniform sampler2D  shadowtex0;
+layout(set = 0, binding = 10) uniform sampler2D shadowcolor0;
+
+const float SH_C0 = 0.28209479;
+const float SH_C1 = 0.48860251;
+const float CL_C0 = 0.88622693;
+const float CL_C1 = 1.02332671;
+
+const ivec3 NEIGHBOR_OFFSETS[6] = ivec3[6](
+    ivec3( 1,  0,  0),
+    ivec3(-1,  0,  0),
+    ivec3( 0,  1,  0),
+    ivec3( 0, -1,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  0, -1)
+);
+
+const vec3 STAINED_GLASS_TINT[16] = vec3[16](
+    vec3(0.92, 0.92, 0.92), // 0: WHITE
+    vec3(0.95, 0.48, 0.14), // 1: ORANGE
+    vec3(0.82, 0.28, 0.80), // 2: MAGENTA
+    vec3(0.32, 0.72, 0.96), // 3: LIGHT_BLUE
+    vec3(0.96, 0.86, 0.20), // 4: YELLOW
+    vec3(0.46, 0.86, 0.18), // 5: LIME
+    vec3(0.96, 0.56, 0.72), // 6: PINK
+    vec3(0.38, 0.40, 0.44), // 7: GRAY
+    vec3(0.66, 0.68, 0.70), // 8: LIGHT_GRAY
+    vec3(0.16, 0.68, 0.74), // 9: CYAN
+    vec3(0.56, 0.22, 0.82), // 10: PURPLE
+    vec3(0.20, 0.34, 0.92), // 11: BLUE
+    vec3(0.52, 0.34, 0.18), // 12: BROWN
+    vec3(0.26, 0.62, 0.22), // 13: GREEN
+    vec3(0.90, 0.18, 0.16), // 14: RED
+    vec3(0.14, 0.14, 0.16)  // 15: BLACK
+);
+
+vec4 dirToSH(vec3 d) {
+    return vec4(SH_C0, SH_C1 * d.y, SH_C1 * d.z, SH_C1 * d.x);
+}
+
+vec4 dirToCosineLobe(vec3 d) {
+    return vec4(CL_C0, CL_C1 * d.y, CL_C1 * d.z, CL_C1 * d.x);
+}
+
+vec2 shadowDistortUV(vec2 ndcXY) {
+    float l = length(ndcXY);
+    vec2 d = (l > 0.00001) ? (ndcXY / (l * 0.8 + 0.2)) : ndcXY;
+    return d * 0.5 + 0.5;
+}
+
+void main() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID.xyz);
+    if (gid.x >= 64 || gid.y >= 64 || gid.z >= 64) return;
+
+    uint rawMask = texelFetch(uVoxelMask, gid, 0).r;
+    uint mask = rawMask & 0x7Fu;
+    vec4 em = texelFetch(uEmissiveTex, gid, 0);
+
+    // Opaque non-emissive solid voxel: 100% blocks light propagation (zero through-wall bleeding)
+    if (mask == 1u && em.a <= 0.004) {
+        imageStore(uShROut, gid, vec4(0.0));
+        imageStore(uShGOut, gid, vec4(0.0));
+        imageStore(uShBOut, gid, vec4(0.0));
+        return;
+    }
+
+    // 1. Direct emissive block & held-light injection (balanced bounce so recessed ledges stay lit while shadows stay deep)
+    float emStrength = em.a * 4.0;
+    vec3 emColor = em.rgb * emStrength;
+
+    vec4 outR = vec4(emColor.r * SH_C0 * 1.25, 0.0, 0.0, 0.0);
+    vec4 outG = vec4(emColor.g * SH_C0 * 1.25, 0.0, 0.0, 0.0);
+    vec4 outB = vec4(emColor.b * SH_C0 * 1.25, 0.0, 0.0, 0.0);
+
+    // 2. Gather propagated L1 SH flux from all 6 face-adjacent toroidal neighbors.
+    //    Longer multi-bounce propagation (FACE_GAIN = 0.64 -> eigenvalue 0.96 < 1.0, strictly stable)
+    //    so indirect light flows smoothly around corners and down into lower cave ledges.
+    const float FACE_GAIN = 0.64;
+    const float WALL_BOUNCE_GAIN = 1.12;
+    ivec3 localCoord = (gid - uPush.lpvOrigin) & 63;
+    vec3 solidBounceNormal = vec3(0.0);
+    int solidNeighbors = 0;
+    vec3 wallAlbedos[6];
+    ivec3 wallOffsets[6];
+    int wallCount = 0;
+
+    for (int i = 0; i < 6; i++) {
+        ivec3 offset = NEIGHBOR_OFFSETS[i];
+        // Prevent toroidal wrap-around light leaking across opposite 64m grid boundaries when stationary
+        ivec3 nLocal = localCoord + offset;
+        if (any(lessThan(nLocal, ivec3(0))) || any(greaterThan(nLocal, ivec3(63)))) {
+            continue;
+        }
+        ivec3 nCoord = (gid + offset) & 63;
+
+        uint nRaw = texelFetch(uVoxelMask, nCoord, 0).r;
+        uint nMask = nRaw & 0x7Fu;
+        if (nMask == 1u) {
+            // Neighbor at +offset is solid -> surface normal points toward this air cell (-offset)
+            solidBounceNormal += vec3(-offset);
+            solidNeighbors++;
+            if ((nRaw & 0x80u) == 0u) {
+                vec4 nEm = texelFetch(uEmissiveTex, nCoord, 0);
+                if (nEm.a <= 0.004 && (nEm.r + nEm.g + nEm.b) > 0.004) {
+                    wallAlbedos[wallCount] = nEm.rgb;
+                    wallOffsets[wallCount] = offset;
+                    wallCount++;
+                }
+            }
+            continue;
+        }
+        // Skip newly wrapped stale toroidal slices (bit 7) so ghost lights never wrap around
+        if ((nRaw & 0x80u) != 0u) continue;
+
+        vec4 nR = texelFetch(uShRIn, nCoord, 0);
+        vec4 nG = texelFetch(uShGIn, nCoord, 0);
+        vec4 nB = texelFetch(uShBIn, nCoord, 0);
+        if (any(isnan(nR)) || any(isinf(nR))) nR = vec4(0.0);
+        if (any(isnan(nG)) || any(isinf(nG))) nG = vec4(0.0);
+        if (any(isnan(nB)) || any(isinf(nB))) nB = vec4(0.0);
+
+        vec3 travelDir = vec3(-offset);
+        vec4 evalLobe = dirToCosineLobe(travelDir);
+
+        float fluxR = max(0.0, dot(nR, evalLobe)) * FACE_GAIN;
+        float fluxG = max(0.0, dot(nG, evalLobe)) * FACE_GAIN;
+        float fluxB = max(0.0, dot(nB, evalLobe)) * FACE_GAIN;
+
+        vec4 shWeight = vec4(SH_C0, 0.90 * SH_C1 * travelDir.y, 0.90 * SH_C1 * travelDir.z, 0.90 * SH_C1 * travelDir.x);
+        outR += shWeight * fluxR;
+        outG += shWeight * fluxG;
+        outB += shWeight * fluxB;
+    }
+
+    // 2b. Oscillation-free Secondary Colored Wall Bounce (Point-Light & Sun Color Bleeding):
+    //     Broad hemispherical bounce lobe (0.85 * SH_C1) radiates sideways as well as outward,
+    //     extending colored wall bounce smoothly across adjacent floors, walls, and overhangs.
+    if (wallCount > 0) {
+        vec4 incR = outR;
+        vec4 incG = outG;
+        vec4 incB = outB;
+        float perWallGain = WALL_BOUNCE_GAIN / sqrt(float(wallCount));
+        for (int w = 0; w < wallCount; w++) {
+            vec3 intoWallDir = vec3(wallOffsets[w]);
+            vec4 hitLobe = dirToCosineLobe(intoWallDir);
+            float inR = max(0.0, dot(incR, hitLobe));
+            float inG = max(0.0, dot(incG, hitLobe));
+            float inB = max(0.0, dot(incB, hitLobe));
+
+            vec3 bounced = min(vec3(inR, inG, inB) * wallAlbedos[w] * perWallGain, vec3(inR, inG, inB) * 0.85);
+            vec3 bounceDir = -intoWallDir;
+            vec4 bounceSH = vec4(SH_C0, 0.85 * SH_C1 * bounceDir.y, 0.85 * SH_C1 * bounceDir.z, 0.85 * SH_C1 * bounceDir.x);
+            outR += bounceSH * bounced.r;
+            outG += bounceSH * bounced.g;
+            outB += bounceSH * bounced.b;
+        }
+    }
+
+    // 3. Unified Voxel Sun-Bounce GI Injection (replaces heavy screen-space SSGI + SVGF!)
+    //    Uses a wide hemispherical lobe (0.75 * SH_C1) so sunlit grass/sand/wood spreads laterally
+    //    across multiple shaded neighbor blocks instead of concentrating only on the immediate cell.
+    if (solidNeighbors > 0 && mask != 1u) {
+        vec3 worldSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+        float rainClear = 1.0 - saturate(rainStrength);
+        float sunVis = smoothstep(0.04, 0.28, worldSunDir.y) * rainClear;
+        if (sunVis > 0.01) {
+            float nLen = length(solidBounceNormal);
+            vec3 bounceN = (nLen > 1e-4) ? (solidBounceNormal / nLen) : vec3(0.0, 1.0, 0.0);
+
+            // Reconstruct exact world integer coordinate from toroidal gid & uPush.lpvOrigin
+            // Shift lookup slightly toward the adjacent solid block face so RSM albedo & shadow match the actual surface
+            ivec3 worldCell = uPush.lpvOrigin + localCoord;
+            vec3 worldRel = vec3(worldCell) + 0.5 - bounceN * 0.35 - cameraPosition;
+
+            vec4 sClip = shadowProjection * shadowModelView * vec4(worldRel, 1.0);
+            vec3 sNDC = sClip.xyz / max(abs(sClip.w), 1e-5);
+            if (abs(sNDC.x) < 0.94 && abs(sNDC.y) < 0.94 && sNDC.z > 0.002 && sNDC.z < 0.996) {
+                vec2 sUV = shadowDistortUV(sNDC.xy);
+                vec2 sTexel = vec2(1.5) / vec2(max(textureSize(shadowtex0, 0), ivec2(512)));
+                float rz = sNDC.z - 0.0022;
+                float sVis = 0.0;
+                sVis += (rz <= textureLod(shadowtex0, clamp(sUV + vec2( sTexel.x,  sTexel.y), vec2(0.001), vec2(0.999)), 0.0).r) ? 0.25 : 0.0;
+                sVis += (rz <= textureLod(shadowtex0, clamp(sUV + vec2(-sTexel.x,  sTexel.y), vec2(0.001), vec2(0.999)), 0.0).r) ? 0.25 : 0.0;
+                sVis += (rz <= textureLod(shadowtex0, clamp(sUV + vec2( sTexel.x, -sTexel.y), vec2(0.001), vec2(0.999)), 0.0).r) ? 0.25 : 0.0;
+                sVis += (rz <= textureLod(shadowtex0, clamp(sUV + vec2(-sTexel.x, -sTexel.y), vec2(0.001), vec2(0.999)), 0.0).r) ? 0.25 : 0.0;
+                if (sVis > 0.01) {
+                    vec4 rsm = textureLod(shadowcolor0, sUV, 0.0);
+                    vec3 bounceAlbedo = pow(max(rsm.rgb, vec3(0.0)), vec3(1.85));
+                    float emitterNdotL = max(rsm.a, 0.18);
+                    vec3 sunCol = mix(vec3(1.0, 0.48, 0.14), vec3(1.0, 0.97, 0.88), saturate(worldSunDir.y * 2.4));
+
+                    vec3 bounceRadiance = bounceAlbedo * sunCol * (emitterNdotL * sunVis * sVis * 2.65);
+                    vec4 bounceSH = vec4(SH_C0, 0.75 * SH_C1 * bounceN.y, 0.75 * SH_C1 * bounceN.z, 0.75 * SH_C1 * bounceN.x);
+                    outR += bounceSH * bounceRadiance.r;
+                    outG += bounceSH * bounceRadiance.g;
+                    outB += bounceSH * bounceRadiance.b;
+                }
+            }
+        }
+    }
+
+    // 4. Stained glass RGB transmission filtering (mask 2..17 -> DyeColor 0..15)
+    if (mask >= 2u && mask <= 17u) {
+        vec3 tint = STAINED_GLASS_TINT[mask - 2u];
+        outR *= tint.r;
+        outG *= tint.g;
+        outB *= tint.b;
+    }
+
+    // 5. Damped Jacobi temporal relaxation (eliminates 6-neighbor red-black checkerboard oscillation
+    //    and shadow-snap flicker while converging to the exact same steady-state GI brightness!)
+    if ((rawMask & 0x80u) == 0u) {
+        vec4 selfR = texelFetch(uShRIn, gid, 0);
+        vec4 selfG = texelFetch(uShGIn, gid, 0);
+        vec4 selfB = texelFetch(uShBIn, gid, 0);
+        if (any(isnan(selfR)) || any(isinf(selfR))) selfR = vec4(0.0);
+        if (any(isnan(selfG)) || any(isinf(selfG))) selfG = vec4(0.0);
+        if (any(isnan(selfB)) || any(isinf(selfB))) selfB = vec4(0.0);
+        outR = mix(selfR, outR, 0.58);
+        outG = mix(selfG, outG, 0.58);
+        outB = mix(selfB, outB, 0.58);
+    }
+
+    if (any(isnan(outR)) || any(isinf(outR))) outR = vec4(0.0);
+    if (any(isnan(outG)) || any(isinf(outG))) outG = vec4(0.0);
+    if (any(isnan(outB)) || any(isinf(outB))) outB = vec4(0.0);
+
+    imageStore(uShROut, gid, clamp(outR, vec4(-10.0), vec4(10.0)));
+    imageStore(uShGOut, gid, clamp(outG, vec4(-10.0), vec4(10.0)));
+    imageStore(uShBOut, gid, clamp(outB, vec4(-10.0), vec4(10.0)));
+}
