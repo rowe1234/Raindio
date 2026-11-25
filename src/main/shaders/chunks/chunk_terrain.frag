@@ -298,8 +298,9 @@ void main() {
     float NdotL_raw = dot(worldN, worldLightDir);
     float NdotL = max(NdotL_raw, 0.0);
 
-    // Strict skyLight gate blocks sun/moon light leaking into enclosed rooms and caves
-    float skyShadowGate = smoothstep(0.20, 0.55, vLightmap.y);
+    // Gate sun/moon light in completely sealed underground caves (skyLight == 0) while allowing
+    // sunlight streaming through glass windows into roofed indoor rooms (skyLight >= 1) to stay visible
+    float skyShadowGate = smoothstep(0.02, 0.16, vLightmap.y);
     float shadow = 0.0;
     if ((geomNdotL > 0.001 || isPlant) && skyShadowGate > 0.001) {
         shadow = sampleShadowPCSS(vWorldRel, geomN, worldLightDir, geomNdotL, isPlant, vLightmap.y) * skyShadowGate;

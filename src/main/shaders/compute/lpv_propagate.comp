@@ -103,8 +103,8 @@ void main() {
     // 2. Gather propagated L1 SH flux from all 6 face-adjacent toroidal neighbors.
     //    Longer multi-bounce propagation (FACE_GAIN = 0.64 -> eigenvalue 0.96 < 1.0, strictly stable)
     //    so indirect light flows smoothly around corners and down into lower cave ledges.
-    const float FACE_GAIN = 0.64;
-    const float WALL_BOUNCE_GAIN = 1.12;
+    const float FACE_GAIN = 0.62;
+    const float WALL_BOUNCE_GAIN = 0.88;
     ivec3 localCoord = (gid - uPush.lpvOrigin) & 63;
     vec3 solidBounceNormal = vec3(0.0);
     int solidNeighbors = 0;
@@ -228,11 +228,14 @@ void main() {
     }
 
     // 4. Stained glass RGB transmission filtering (mask 2..17 -> DyeColor 0..15)
+    //    Neutralize narrow-band emitter bias (e.g. orange glowstone / cyan sea lantern) before tinting
+    //    so every glass hue (red/orange/yellow/green/cyan/blue/purple) transmits vividly with balanced luminance.
     if (mask >= 2u && mask <= 17u) {
         vec3 tint = STAINED_GLASS_TINT[mask - 2u];
-        outR *= tint.r;
-        outG *= tint.g;
-        outB *= tint.b;
+        vec4 avgSH = 0.2126 * outR + 0.7152 * outG + 0.0722 * outB;
+        outR = mix(outR, avgSH, 0.75) * tint.r;
+        outG = mix(outG, avgSH, 0.75) * tint.g;
+        outB = mix(outB, avgSH, 0.75) * tint.b;
     }
 
     // 5. Damped Jacobi temporal relaxation (eliminates 6-neighbor red-black checkerboard oscillation

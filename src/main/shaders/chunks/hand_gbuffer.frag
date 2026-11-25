@@ -135,7 +135,9 @@ void main() {
         discard;
     }
 
-    // World-space normal with geometric derivative fallback & double-sided flip
+    // World-space normal with geometric derivative fallback.
+    // Never use !gl_FrontFacing in Vulkan Y-down clip space (inverted Y flips winding and turns hand normals backwards!);
+    // instead orient double-sided flat item quads toward the camera only when strongly back-facing.
     float nLen = length(vWorldNormal);
     vec3 worldN;
     if (nLen > 1e-4) {
@@ -147,7 +149,8 @@ void main() {
         float cLen = length(cn);
         worldN = (cLen > 1e-8) ? (cn / cLen) : vec3(0.0, 1.0, 0.0);
     }
-    if (!gl_FrontFacing) {
+    vec3 toCam = normalize(-vWorldRel);
+    if (dot(worldN, toCam) < -0.20) {
         worldN = -worldN;
     }
 
@@ -175,7 +178,7 @@ void main() {
     float rawNdotL = max(dot(worldN, worldLightDir), 0.0);
     float wrapNdotL = clamp((dot(worldN, worldLightDir) + 0.25) / 1.25, 0.0, 1.0);
 
-    float skyShadowGate = smoothstep(0.14, 0.48, vLightmap.y);
+    float skyShadowGate = smoothstep(0.02, 0.16, vLightmap.y);
     float shadow = (skyShadowGate > 0.001) ? (sampleHandWorldShadow(worldLightDir) * skyShadowGate) : 0.0;
 
     float nightSkyLift = mix(1.15, 1.0, smoothstep(-0.10, 0.18, worldSunDir.y));
@@ -183,7 +186,7 @@ void main() {
     vec3 directLight = sunLightCol * (mix(rawNdotL, wrapNdotL, 0.30) * shadow);
 
     // 3-Zone Directional Sky Ambient strictly gated by outdoor sky exposure
-    float skyMask = pow(smoothstep(0.08, 1.0, vLightmap.y), 2.0);
+    float skyMask = pow(smoothstep(0.06, 1.0, vLightmap.y), 1.8);
     float upMask = saturate(worldN.y);
     float downMask = saturate(-worldN.y);
     float sunBounceAlign = saturate(dot(worldN, -worldLightDir) * 0.5 + 0.5);
@@ -194,16 +197,23 @@ void main() {
     directionalAmb = mix(directionalAmb, groundBounceFill, downMask);
     vec3 skyAmb = directionalAmb * (skyMask * nightSkyLift);
 
-    // Real-time colored RT point-light illumination on first-person hand (no vanilla blocklight)
+    // Real-time colored RT point-light + room bounce GI fill on first-person hand
     vec3 blockLight = vec3(0.0);
     if (handPtDirAndStr.w > 0.5) {
         vec3 ptDir = normalize(handPtDirAndStr.xyz);
-        float ptNdotL = clamp((dot(worldN, ptDir) + 0.35) / 1.35, 0.0, 1.0);
-        blockLight += handPtColor.rgb * (ptNdotL * 0.95);
+        float ptNdotL = clamp((dot(worldN, ptDir) + 0.40) / 1.40, 0.0, 1.0);
+        blockLight += handPtColor.rgb * (ptNdotL * 1.15);
     }
-    blockLight += handPtAmb.rgb * 0.75;
-    vec3 heldLightFill = handEmissiveColorAndStrength.rgb * (heldEmissiveStrength * 0.55);
-    vec3 caveAmb = vec3(0.0);
+    blockLight += handPtAmb.rgb * 1.10;
+    // Indirect room bounce fallback tinted by nearby point-light hue so the hand matches LPV-lit rooms
+    float bl = vLightmap.x;
+    if (bl > 0.01) {
+        float ambPeak = max(handPtAmb.r, max(handPtAmb.g, handPtAmb.b));
+        vec3 roomHue = (ambPeak > 0.02) ? (handPtAmb.rgb / ambPeak) : vec3(1.0, 0.86, 0.68);
+        blockLight += roomHue * (bl * bl * 0.42);
+    }
+    vec3 heldLightFill = handEmissiveColorAndStrength.rgb * (heldEmissiveStrength * 0.65);
+    vec3 caveAmb = vec3(0.008, 0.010, 0.014);
 
     // Pixel-selective GGX PBR specular (bright/metallic pixels glint smoothly)
     vec3 H = normalize(worldLightDir + worldViewDir);

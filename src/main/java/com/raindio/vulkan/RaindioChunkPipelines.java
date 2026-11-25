@@ -128,14 +128,14 @@ public final class RaindioChunkPipelines implements AutoCloseable {
                 new String[] { "Sampler0", "Sampler2" },
                 new ColorTargetState[] { RGBA16F_TRANSLUCENT_TARGET },
                 TRANSLUCENT_DEPTH_TEST_ONLY,
-                false);
+                true);
         this.translucentTintMulti = buildAndCache(device, "chunks/chunk_translucent_tint", true,
                 RenderPipelines.TRANSLUCENT_TERRAIN_MULTIDRAW,
                 new String[] { "FrameUniforms", "Globals", "TerrainUniform" },
                 new String[] { "Sampler0", "Sampler2" },
                 new ColorTargetState[] { RGBA16F_TRANSLUCENT_TARGET },
                 TRANSLUCENT_DEPTH_TEST_ONLY,
-                false);
+                true);
 
         this.waterSingle = buildAndCache(device, "chunks/chunk_water", false,
                 RenderPipelines.TRANSLUCENT_TERRAIN,

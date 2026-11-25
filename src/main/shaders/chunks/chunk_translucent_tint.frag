@@ -40,10 +40,11 @@ void main() {
     float bl = vLightmap.x;
 
     vec3 sunFill = sunCol * (0.45 * sunIntensity * rainClear * skyMask);
-    vec3 skyFill = skyCol * (0.42 * skyMask) + vec3(0.012, 0.016, 0.024);
-    vec3 blockFill = vec3(1.0, 0.68, 0.36) * (bl * bl * 1.25);
+    vec3 skyFill = skyCol * (0.38 * skyMask) + vec3(0.010, 0.014, 0.020);
+    // Neutral white-balanced blocklight fill so blue/cyan/green stained glass never turns muddy orange
+    vec3 blockFill = vec3(0.95, 0.96, 1.00) * (bl * bl * 0.45);
 
     vec3 litTranslucent = linearAlbedo * (sunFill + skyFill + blockFill);
-    float layerAlpha = clamp(albedo.a * 0.72, 0.06, 0.85);
+    float layerAlpha = clamp(albedo.a * 0.42, 0.05, 0.55);
     fragColor = vec4(max(litTranslucent, vec3(0.0)), layerAlpha);
 }

@@ -196,6 +196,7 @@ public final class RaindioCompositePipelines implements AutoCloseable {
             RaindioNoiseTexture noise,
             RaindioLpvManager lpvManager,
             RaindioPointLightManager pointLights,
+            RaindioRtReflectionManager rtReflections,
             RaindioAutoExposure autoExposure,
             RaindioConfig config,
             GpuTextureView mainColorView,
@@ -275,6 +276,11 @@ public final class RaindioCompositePipelines implements AutoCloseable {
             pass.setUniform("shadowtex0", att.shadowtex0View(), nearestClamp);
             pass.setUniform("shadowcolor0", att.shadowcolor0View(), linearClamp);
             pass.draw(3, 1, 0, 0);
+        }
+
+        // 3b. Native Vulkan SEUS PTGI-Style Hybrid Ray-Traced Reflections -> colortex9.rgb (preserves colortex9.a GTAO)
+        if (rtReflections != null && rtReflections.isAvailable()) {
+            rtReflections.dispatch(encoder, att, uniforms, noise, lpvManager);
         }
 
         // 4. composite3: reads colortex0 -> writes colortex0Scratch (ZERO fullscreen copy ping-pong!)

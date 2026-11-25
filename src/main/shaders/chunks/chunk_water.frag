@@ -42,7 +42,9 @@ void main() {
         fragData1 = vec4(octEncode(worldN), float(MAT_WATER_STILL) / 255.0, vLightmap.y);
         fragData2 = vec4(vColor.rgb, 1.0);
     } else {
-        fragData1 = vec4(octEncode(worldN), float(MAT_OTHER_TRANSLUCENT) / 255.0, vLightmap.y);
+        // Classify semi-transparent stained/tinted glass as MAT_GLASS_TINTED so composite3 applies crisp glass Fresnel
+        int matId = (albedo.a < 0.92) ? MAT_GLASS_TINTED : MAT_OTHER_TRANSLUCENT;
+        fragData1 = vec4(octEncode(worldN), float(matId) / 255.0, vLightmap.y);
         fragData2 = vec4(pow(max(albedo.rgb, vec3(0.0)), vec3(1.5)), albedo.a);
     }
 }

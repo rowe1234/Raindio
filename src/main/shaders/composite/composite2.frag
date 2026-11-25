@@ -168,137 +168,11 @@ void main() {
     vec3 reflection = vec3(0.0);
     float terrainOcclusion = 1.0;
 
-    // ==================== 1. PTGI Stabilized SSR + Gated Shadow-Map RSM Fallback ====================
-    if (isWater) {
-        vec3 waterViewPos = ScreenToView(uv, waterDepth);
-        vec3 waterViewDir = normalize(waterViewPos);
-
-        // Read precomputed PTGI water normal from colortex3
-        vec4 waterData = textureLod(colortex3, uv, 0.0);
-        vec3 waterWorldNormal = octDecode(waterData.rg);
-        vec3 waterNormal = normalize(mat3(gbufferModelView) * waterWorldNormal);
-
-        float NdotV_raw = dot(waterNormal, -waterViewDir);
-        if (NdotV_raw < 0.002) {
-            waterNormal = normalize(waterNormal - waterViewDir * (0.002 - NdotV_raw));
-        }
-
-        vec3 geometricWorldNormal = octDecode(encodedDataN);
-        geometricWorldNormal.y = underwater ? -abs(geometricWorldNormal.y) : abs(geometricWorldNormal.y);
-        vec3 flatViewNormal = normalize(mat3(gbufferModelView) * normalize(geometricWorldNormal));
-
-        // Full wave-perturbed reflection ray for sky, clouds & off-screen RSM fallback
-        vec3 liftedReflectDir = reflect(waterViewDir, waterNormal);
-        if (!underwater) {
-            float up = dot(liftedReflectDir, flatViewNormal);
-            if (up < 0.020) {
-                liftedReflectDir = normalize(liftedReflectDir + flatViewNormal * (0.020 - up));
-            }
-        }
-        liftedReflectDir = normalize(liftedReflectDir);
-
-        // Stabilized SSR normal blend (0.45) to keep reflections coherent & unbroken while undulating naturally
-        vec3 ssrNormal = normalize(mix(flatViewNormal, waterNormal, underwater ? 0.40 : 0.45));
-        vec3 ssrReflectDir = reflect(waterViewDir, ssrNormal);
-        if (!underwater) {
-            float upSSR = dot(ssrReflectDir, flatViewNormal);
-            if (upSSR < 0.025) {
-                ssrReflectDir = normalize(ssrReflectDir + flatViewNormal * (0.025 - upSSR));
-            }
-        }
-        ssrReflectDir = normalize(ssrReflectDir);
-
-        vec2 microPerturbUV = (waterNormal - ssrNormal).xy * 0.028;
-        vec3 startWaterPos = waterViewPos + flatViewNormal * 0.055;
-        vec4 ssr = ray_trace_ssr(ssrReflectDir, startWaterPos, ssrDither, microPerturbUV);
-        reflection = ssr.rgb;
-
-        float rsmDebugAlpha = 0.0;
-
-        if (ssr.a < 0.99) {
-            vec3 reflectWorldDir = normalize((gbufferModelViewInverse * vec4(liftedReflectDir, 0.0)).xyz);
-
-            if (!underwater) {
-                vec3 skyReflDir = normalize(vec3(reflectWorldDir.x, max(reflectWorldDir.y, 0.015), reflectWorldDir.z));
-                vec3 skyRefl = ComputeFullSkyHDR(colortex6, skyReflDir, realSunDir, sunColor, sunHeight, twilightBlend, rainStrength, frameTimeCounter, false);
-
-                // Gently damp overly luminous horizon sky belt in water reflections
-                skyRefl *= mix(0.76, 1.0, smoothstep(0.0, 0.28, skyReflDir.y));
-                skyRefl *= mix(1.0, 0.68, saturate(rainStrength));
-
-                // SkyLight occlusion so cave/overhang water doesn't reflect bright outdoor sky
-                float skyLightFactor = smoothstep(0.08, 0.88, skyLightData);
-                vec3 indoorAmbient = vec3(0.004, 0.008, 0.014) * nightDim;
-                skyRefl = mix(indoorAmbient, skyRefl, skyLightFactor);
-
-                // Sun-elevation & upward-ray gate: avoids low-sun cliff ghosting and wasted sky-ray tracing
-                float rsmGate = smoothstep(0.15, 0.40, abs(realSunDir.y))
-                              * (1.0 - smoothstep(0.55, 0.85, reflectWorldDir.y));
-
-                vec3 fallbackRefl = skyRefl;
-                if (skyLightFactor > 0.05 && rsmGate > 0.01) {
-                    vec3 rsmStartPos = waterViewPos + flatViewNormal * 0.08;
-                    vec4 shadowRefl = ray_trace_shadow_reflection(rsmStartPos, liftedReflectDir, realSunDir, ssrDither);
-                    float gatedAlpha = shadowRefl.a * rsmGate;
-                    rsmDebugAlpha = gatedAlpha;
-                    vec3 shadedRsm = mix(indoorAmbient, shadowRefl.rgb, skyLightFactor);
-                    fallbackRefl = mix(skyRefl, shadedRsm, gatedAlpha);
-                }
-
-                reflection = mix(fallbackRefl, ssr.rgb, ssr.a);
-            } else {
-                float depthGrad = saturate(-reflectWorldDir.y * 0.5 + 0.5);
-                vec3 deepScatter = mix(vec3(0.022, 0.165, 0.148), vec3(0.012, 0.095, 0.088), depthGrad) * nightDim;
-                if (isDay) deepScatter *= mix(0.42, 1.0, mainLightVis);
-                deepScatter *= mix(0.28, 1.0, smoothstep(0.1, 0.9, skyLightData));
-                reflection = mix(deepScatter, ssr.rgb, ssr.a);
-            }
-        }
-
-        // Subtle aqua-teal tint on water reflections to prevent distant horizon wash-out
-        if (!underwater) {
-            reflection *= mix(vec3(1.0), vec3(0.84, 0.98, 0.94), 0.42);
-        }
-
-#if DEBUG_VIEW == 15
-        // R = SSR alpha, G = RSM off-screen alpha (outside SSR), B = Sky fallback
-        float effRsm = rsmDebugAlpha * (1.0 - ssr.a);
-        float effSky = clamp(1.0 - ssr.a - effRsm, 0.0, 1.0);
-        fragData0 = vec4(ssr.a, effRsm, effSky, 1.0);
-        return;
-#endif
-    }
-    // ==================== 2. Glass & Translucent Reflections ====================
-    else if (isGlass) {
-        vec3 glassViewPos = ScreenToView(uv, waterDepth);
-        vec3 glassViewDir = normalize(glassViewPos);
-        float skyLightFactor = smoothstep(0.05, 0.85, skyLightData);
-
-        vec3 glassWorldNormal = octDecode(encodedDataN);
-        vec3 glassNormal = normalize(mat3(gbufferModelView) * glassWorldNormal);
-
-        vec3 reflectViewDir = normalize(reflect(glassViewDir, glassNormal));
-        vec3 startGlassPos = glassViewPos + glassNormal * 0.06;
-        vec4 ssr = ray_trace_ssr(reflectViewDir, startGlassPos, ssrDither, vec2(0.0));
-        reflection = ssr.rgb;
-
-        if (ssr.a < 0.98) {
-            vec3 reflectWorldDir = normalize((gbufferModelViewInverse * vec4(reflectViewDir, 0.0)).xyz);
-            vec3 skyReflDir = normalize(vec3(reflectWorldDir.x, max(reflectWorldDir.y, 0.04), reflectWorldDir.z));
-            vec3 skyRefl = ComputeFullSkyHDR(colortex6, skyReflDir, realSunDir, sunColor, sunHeight, twilightBlend, rainStrength, frameTimeCounter, false);
-
-            vec3 indoorAmbient = vec3(0.005, 0.008, 0.012) * nightDim;
-            skyRefl = mix(indoorAmbient, skyRefl, skyLightFactor);
-
-            reflection = mix(skyRefl, ssr.rgb, ssr.a);
-        }
-    }
-    // ==================== 3. Opaque Terrain: GTAO + Contact Shadows + Wet Reflections ====================
-    else if (isNotSky) {
+    // Reflections for water, glass, and wet puddles are now traced in true 3D world space
+    // by compute/rt_reflections.comp (3D Voxel DDA + 4x4x4 Sub-Voxel + Shadow-Map + LPV + Sky).
+    // composite2 now focuses solely on fast Horizon-Based GTAO + Contact Shadows into colortex9.a.
+    if (isNotSky && !isWater && !isGlass) {
         vec3 viewPos = ScreenToView(uv, waterDepth);
-        vec3 viewDir = normalize(viewPos);
-        float viewDist = length(viewPos);
-
         vec3 worldNormal = octDecode(encodedDataN);
         vec3 terrainViewNormal = normalize(mat3(gbufferModelView) * worldNormal);
 
@@ -314,38 +188,7 @@ void main() {
         }
 #endif
         terrainOcclusion = ao * cs;
-
-        if (rainStrength > 0.01) {
-        float isFloor = smoothstep(0.45, 0.85, worldNormal.y);
-        float skyLightFactor = smoothstep(0.60, 0.90, skyLightData);
-
-        if (isFloor > 0.01 && skyLightFactor > 0.01) {
-            vec3 worldPos = (gbufferModelViewInverse * vec4(viewPos, 1.0)).xyz + cameraPosition;
-            float puddle = get_puddle_mask(worldPos.xz);
-            float wetness = saturate(rainStrength) * skyLightFactor * isFloor * mix(0.65, 1.0, puddle);
-
-            if (wetness > 0.01) {
-                float rippleFade = 1.0 / (1.0 + viewDist * 0.09);
-                vec2 rippleSlope = get_rain_ripple_slope(worldPos.xz, rainStrength * puddle, skyLightData) * rippleFade * 0.35;
-                vec3 rippledWorldN = normalize(worldNormal + vec3(rippleSlope.x, 0.0, rippleSlope.y));
-                vec3 viewNormal = normalize(mat3(gbufferModelView) * worldNormal);
-                vec3 rippledViewN = normalize(mat3(gbufferModelView) * rippledWorldN);
-
-                vec3 startPos = viewPos + viewNormal * 0.05;
-                vec3 reflectViewDir = normalize(reflect(viewDir, viewNormal));
-                vec2 puddlePerturb = (rippledViewN - viewNormal).xy * 0.025;
-                vec4 ssr = ray_trace_ssr(reflectViewDir, startPos, ssrDither, puddlePerturb);
-
-                vec3 reflectWorldDir = normalize((gbufferModelViewInverse * vec4(reflect(viewDir, rippledViewN), 0.0)).xyz);
-                vec3 skyReflDir = normalize(vec3(reflectWorldDir.x, max(reflectWorldDir.y, 0.04), reflectWorldDir.z));
-                vec3 skyRefl = SampleSkyLUT(colortex6, skyReflDir) * mix(0.65, 0.95, puddle) * skyLightFactor;
-
-                reflection = mix(skyRefl, ssr.rgb, ssr.a);
-            }
-        }
-        }
     }
 
-    reflection = clamp(reflection, vec3(0.0), vec3(12.0));
     fragData0 = vec4(reflection, terrainOcclusion);
 }

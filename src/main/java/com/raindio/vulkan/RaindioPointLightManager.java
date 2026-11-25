@@ -196,16 +196,19 @@ public final class RaindioPointLightManager implements AutoCloseable {
             float win = Math.max(0.0f, 1.0f - u2 * u2);
             win *= win;
             float atten = win / (1.0f + distSq * 0.85f);
+            // Softer multi-bounce indoor GI attenuation so the hand matches LPV-lit rooms
+            float giAtten = win / (1.0f + distSq * 0.22f);
 
             float r = ssboStaging.getFloat(off + 16);
             float g = ssboStaging.getFloat(off + 20);
             float b = ssboStaging.getFloat(off + 24);
             float intensity = ssboStaging.getFloat(off + 28);
             float contrib = intensity * atten;
+            float giContrib = intensity * giAtten;
 
-            ambR += r * contrib * 0.35f;
-            ambG += g * contrib * 0.35f;
-            ambB += b * contrib * 0.35f;
+            ambR += r * giContrib * 0.42f;
+            ambG += g * giContrib * 0.42f;
+            ambB += b * giContrib * 0.42f;
 
             float score = (0.2126f * r + 0.7152f * g + 0.0722f * b) * contrib;
             if (score > bestScore) {

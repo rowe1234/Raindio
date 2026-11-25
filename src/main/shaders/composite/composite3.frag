@@ -401,7 +401,7 @@ void main() {
         vec3 refractionColor = hdr;
 
         if (isSkyDepth(seabedDepth)) {
-            refractionColor = ComputeFullSkyHDR(colortex6, worldDir, realSunDir, sunColor, sunHeight, twilightBlend, rainStrength, frameTimeCounter, false);
+            refractionColor = ComputeFullSkyHDR(colortex6, worldDir, realSunDir, sunColor, sunHeight, twilightBlend, rainStrength, frameTimeCounter, true);
         } else {
             if (underwater) {
                 vec3 seabedViewPos = ScreenToView(uv, seabedDepth);
@@ -422,7 +422,9 @@ void main() {
         vec3 halfVec = normalize(-glassViewDir + mainLightViewDir);
         float NdotH = max(0.0, dot(glassNormal, halfVec));
 
-        vec3 glassDirect = mainLightColor * mainLightVis * (isDay ? 0.65 : 0.03) * NdotL * skyLightFactor;
+        mat4 glassShadowMat = shadowProjection * shadowModelView * gbufferModelViewInverse;
+        float glassShadow = (skyLightFactor > 0.02) ? getSampleShadow(glassViewPos, glassShadowMat) : 0.0;
+        vec3 glassDirect = mainLightColor * mainLightVis * (isDay ? 0.65 : 0.03) * NdotL * skyLightFactor * glassShadow;
         vec3 glassAmbient = (isDay ? vec3(0.22, 0.32, 0.46) : vec3(0.008, 0.014, 0.025)) * mix(0.25, 1.0, skyLightFactor);
 
         float maxFresnel = 0.72;
@@ -475,7 +477,7 @@ void main() {
         hdr = mix(refractionColor, reflection, fresnel);
 
         float specPosition = pow(NdotH, specPow);
-        hdr += mainLightColor * specPosition * mainLightPower * (isDay ? specBoost : 0.02) * mainLightVis * skyLightFactor * (1.0 - saturate(rainStrength));
+        hdr += mainLightColor * specPosition * mainLightPower * (isDay ? specBoost : 0.02) * mainLightVis * skyLightFactor * glassShadow * (1.0 - saturate(rainStrength));
 
         // Clustered PBR point-light highlights & colored glow on glass / ice / translucent panes
         float glassPlWeight = (blockId == MAT_NETHER_PORTAL) ? 0.35 : (isMatGlass(blockId) ? 0.90 : 0.75);

@@ -21,6 +21,7 @@ import com.raindio.vulkan.RaindioHandRenderer;
 import com.raindio.vulkan.RaindioLpvManager;
 import com.raindio.vulkan.RaindioNoiseTexture;
 import com.raindio.vulkan.RaindioPointLightManager;
+import com.raindio.vulkan.RaindioRtReflectionManager;
 import com.raindio.vulkan.RaindioSpirvLoader;
 import com.raindio.vulkan.RaindioUniformManager;
 import java.util.List;
@@ -56,6 +57,7 @@ public final class RaindioFrameController {
     private final RaindioCompositePipelines compositePipelines = new RaindioCompositePipelines();
     private final RaindioLpvManager lpvManager = new RaindioLpvManager();
     private final RaindioPointLightManager pointLightManager = new RaindioPointLightManager();
+    private final RaindioRtReflectionManager rtReflectionManager = new RaindioRtReflectionManager();
     private final RaindioAutoExposure autoExposure = new RaindioAutoExposure();
 
     private RaindioConfig config = new RaindioConfig();
@@ -197,6 +199,7 @@ public final class RaindioFrameController {
                     noiseTexture,
                     lpvManager,
                     pointLightManager,
+                    rtReflectionManager,
                     autoExposure,
                     config,
                     mainColorView,
@@ -292,6 +295,7 @@ public final class RaindioFrameController {
 
     public void onClose() {
         autoExposure.close();
+        rtReflectionManager.close();
         pointLightManager.close();
         lpvManager.close();
         handRenderer.close();

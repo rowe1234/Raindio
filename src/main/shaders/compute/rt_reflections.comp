@@ -1,0 +1,742 @@
+#version 450
+
+// ============================================================================
+// Raindio Native Vulkan Compute — SEUS PTGI-Style Hybrid Ray-Traced Reflections
+//   Stage 1 (Primary): Viewport-Clipped Full-Render-Distance (320m+ / far) Reverse-Z
+//                      Screen-Space Raymarch (72 adaptive steps + 6-step binary refinement)
+//                      using exact texelFetch(colortex0) on verified non-water scene pixels
+//                      -> razor-sharp per-pixel block textures, leaves, shadows & zero white bleed!
+//   Stage 2 (Fallback): Seamless 2-Level Cascaded 3D World-Space Voxel RT (ONLY when ray exits
+//                      viewport or passes behind an occluder!)
+//                      - LOD 0 (0..31m): 1m Voxel DDA + 4x4x4 Sub-Voxels + 16x16 procedural block grain
+//                                        + authentic grass-side dirt/overhang + LPV GI + Shadow
+//                      - LOD 1 (31..124m): 4m Macro-Voxel Clipmap + Real-Time Shadow + Atmospheric blend
+//   Stage 3 (Sky):     Horizon-tamed Physical Atmosphere Sky LUT + Fast Volumetric Clouds Reflection
+//   - Preserves colortex9.a (GTAO) untouched!
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#include "common/raindio_uniforms.glsl"
+#include "lib/common.glsl"
+#include "lib/projection.glsl"
+#include "lib/lighting.glsl"
+
+layout(set = 0, binding = 1)  uniform sampler2D  colortex1;
+layout(set = 0, binding = 2)  uniform sampler2D  colortex3;
+layout(set = 0, binding = 3)  uniform sampler2D  colortex6;
+layout(set = 0, binding = 4)  uniform sampler2D  colortex9In;   // Reads .a (GTAO) from composite2
+layout(set = 0, binding = 5)  uniform sampler2D  depthtex0;
+layout(set = 0, binding = 6)  uniform sampler2D  shadowtex0;
+layout(set = 0, binding = 7)  uniform sampler3D  uFarVoxelTex;  // LOD 1: 64^3 @ 4m/voxel (256m^3 / +-128m)
+layout(set = 0, binding = 8)  uniform usampler3D uVoxelMask;
+layout(set = 0, binding = 9)  uniform usampler3D uSubVoxelMask;
+layout(set = 0, binding = 10) uniform sampler3D  uEmissiveTex;
+layout(set = 0, binding = 11) uniform sampler3D  uLpvShR;
+layout(set = 0, binding = 12) uniform sampler3D  uLpvShG;
+layout(set = 0, binding = 13) uniform sampler3D  uLpvShB;
+layout(set = 0, binding = 14) uniform sampler2D  colortex0;        // Exact lit HDR opaque scene (nearest)
+layout(set = 0, binding = 15) uniform sampler2D  noisetex;         // 256x256 RGBA8 noise for reflected clouds
+layout(set = 0, binding = 16) uniform sampler2D  uBlockAtlas;      // Live Minecraft TextureAtlas.LOCATION_BLOCKS
+layout(set = 0, binding = 17) uniform sampler2D  uBlockPaletteLut; // 1024x3 RGBA32F: row0=topUV, row1=sideUV, row2=tintRGB+flags
+layout(set = 0, binding = 18) uniform usampler3D uVoxelPalette;    // LOD 0: 64^3 R16_UINT block palette ID
+layout(set = 0, binding = 19) uniform usampler3D uFarPalette;      // LOD 1: 128x64x128 R16_UINT block palette ID
+
+layout(set = 0, binding = 20, rgba16f) uniform writeonly image2D uReflOut;
+
+// Provide compute-shader equivalent of gl_FragCoord for lib/clouds.glsl dither
+#define gl_FragCoord vec4(vec2(gl_GlobalInvocationID.xy) + 0.5, 0.0, 1.0)
+#include "lib/clouds.glsl"
+
+const vec3 STAINED_GLASS_TINT[16] = vec3[16](
+    vec3(0.92, 0.92, 0.92), vec3(0.95, 0.48, 0.14), vec3(0.82, 0.28, 0.80), vec3(0.32, 0.72, 0.96),
+    vec3(0.96, 0.86, 0.20), vec3(0.46, 0.86, 0.18), vec3(0.96, 0.56, 0.72), vec3(0.38, 0.40, 0.44),
+    vec3(0.66, 0.68, 0.70), vec3(0.16, 0.68, 0.74), vec3(0.56, 0.22, 0.82), vec3(0.20, 0.34, 0.92),
+    vec3(0.52, 0.34, 0.18), vec3(0.26, 0.62, 0.22), vec3(0.90, 0.18, 0.16), vec3(0.14, 0.14, 0.16)
+);
+
+vec3 sampleSkyLUT(vec3 dir) {
+    vec3 d = normalize(dir);
+    float u = fract(atan(d.z, d.x) / (2.0 * PI) + 0.5);
+    float sy = clamp(d.y, -1.0, 1.0);
+    float v = clamp(sign(sy) * sqrt(abs(sy)) * 0.5 + 0.5, 0.004, 0.996);
+    return textureLod(colortex6, vec2(u, v), 0.0).rgb;
+}
+
+// Compute-safe exact match of lib/fog.glsl apply_terrain_fog so reflected mountains match real terrain haze 1:1
+vec3 applyTerrainFogCompute(vec3 color, vec3 viewPos, vec3 realSunDir) {
+    float viewDist = length(viewPos);
+    vec3 worldDir = normalize((gbufferModelViewInverse * vec4(normalize(viewPos), 0.0)).xyz);
+    float safeFar = max(far, 64.0);
+    float borderFade = smoothstep(safeFar * 0.62, safeFar * 0.98, viewDist);
+
+    vec3 fogDir = normalize(vec3(worldDir.x, max(worldDir.y, 0.0), worldDir.z));
+    vec3 fogAtmColor = sampleSkyLUT(fogDir);
+
+    float sunHeight = realSunDir.y;
+    float sunVis = smoothstep(-0.08, 0.15, sunHeight) * (1.0 - saturate(rainStrength));
+    if (sunVis > 0.001) {
+        float cosTheta = max(0.0, dot(worldDir, realSunDir));
+        float mieGlow = pow(cosTheta, 6.0) * 0.35 + pow(cosTheta, 24.0) * 0.45;
+        vec3 sunFogTint = mix(vec3(1.00, 0.54, 0.36), vec3(0.76, 0.92, 1.00), saturate(sunHeight * 2.5));
+        fogAtmColor += sunFogTint * mieGlow * sunVis * 0.16 * (1.0 - borderFade);
+    }
+
+    fogAtmColor *= mix(1.0, mix(0.75, 1.0, borderFade), saturate(rainStrength));
+
+    vec3 fragWorldPos = (gbufferModelViewInverse * vec4(viewPos, 1.0)).xyz + cameraPosition;
+    float heightDensity = mix(0.70, 1.35, exp(-max(0.0, fragWorldPos.y - 62.0) * 0.015));
+    float nearProtect = smoothstep(10.0, 38.0, viewDist);
+    float dynamicFogDensity = mix(0.0015, 0.0042, saturate(rainStrength)) * heightDensity;
+    float expFog = (1.0 - exp(-viewDist * dynamicFogDensity)) * nearProtect;
+
+    float fogFactor = clamp(max(expFog, borderFade), 0.0, 1.0);
+    return mix(color, fogAtmColor, fogFactor);
+}
+
+vec2 viewToScreenUV(vec3 viewPos) {
+    vec4 clip = gbufferProjection * vec4(viewPos, 1.0);
+    return (clip.xy / max(clip.w, 1e-5)) * 0.5 + 0.5;
+}
+
+// Sample the LIVE Minecraft Block Texture Atlas (uBlockAtlas) using palette-indexed face UVs!
+// Produces 100% authentic 16x16 (or HD resource pack) block textures in off-screen 3D RT reflections.
+vec3 sampleRealBlockAtlasAlbedo(uint paletteId, vec3 fallbackAlbedo, vec3 hitWorldPos, vec3 hitNormal, bool isLeaf) {
+    if (paletteId > 0u && paletteId < 1024u) {
+        bool isTopFace = (abs(hitNormal.y) > 0.5);
+        vec4 uvRect = texelFetch(uBlockPaletteLut, ivec2(int(paletteId), isTopFace ? 0 : 1), 0);
+        if (uvRect.z > 1e-6 && uvRect.w > 1e-6) {
+            // Compute right-side-up [0, 1]^2 local UV on the hit block face
+            vec2 fuv;
+            if (isTopFace) {
+                fuv = fract(hitWorldPos.xz);
+            } else if (abs(hitNormal.x) > 0.5) {
+                fuv = vec2(fract(hitWorldPos.z), 1.0 - fract(hitWorldPos.y));
+            } else {
+                fuv = vec2(fract(hitWorldPos.x), 1.0 - fract(hitWorldPos.y));
+            }
+            fuv = clamp(fuv, vec2(0.002), vec2(0.998));
+            vec2 atlasUV = uvRect.xy + fuv * uvRect.zw;
+            vec4 tex = textureLod(uBlockAtlas, atlasUV, 0.0);
+
+            // Convert sRGB block texture to linear space matching chunk_terrain.frag (pow 2.1)
+            vec3 linCol = pow(max(tex.rgb, vec3(0.001)), vec3(2.1));
+
+            // Apply Minecraft BlockColors biome tint when this face is tinted (e.g. grass top, leaves)
+            vec4 tintInfo = texelFetch(uBlockPaletteLut, ivec2(int(paletteId), 2), 0);
+            int tintFlags = int(tintInfo.w + 0.5);
+            bool faceTinted = isTopFace ? ((tintFlags & 1) != 0) : ((tintFlags & 2) != 0);
+            if (faceTinted) {
+                vec3 linTint = pow(max(tintInfo.rgb, vec3(0.02)), vec3(2.1));
+                linCol *= linTint;
+            }
+
+            if (isLeaf && tex.a < 0.45) {
+                linCol *= 0.35;
+            }
+            return max(linCol, vec3(0.01));
+        }
+    }
+    return max(fallbackAlbedo, vec3(0.015));
+}
+
+// ============================================================================
+// Stage 1: SEUS PTGI-Style Viewport-Clipped Full-Render-Distance Screen-Space Trace
+//   - Clips (uv0 -> uv1) to [0.001, 0.999]^2 BEFORE stepping so ZERO steps are wasted off-screen!
+//   - Perspective-correct Reverse-Z march up to max(far * 1.15, 320m), 72 steps + 6-step binary refine
+//   - Strict texelFetch(colortex0) on verified non-water, non-sky scene pixels -> ZERO white bleed!
+//   - Sets needsVoxelFallback=true ONLY when ray exits viewport or passes behind an occluder
+// ============================================================================
+vec4 traceScreenSpacePrimary(
+    vec3 startViewPos, vec3 reflectViewDir, vec3 realSunDir,
+    ivec2 fullSize, float dither, bool isWaterSurface,
+    out bool needsVoxelFallback
+) {
+    needsVoxelFallback = true;
+
+    // Reject rays pointing strongly back toward camera -> needs 3D voxel fallback
+    if (reflectViewDir.z > 0.72) return vec4(0.0);
+
+    vec3 p0 = startViewPos + reflectViewDir * (0.06 + 0.03 * dither);
+    if (p0.z >= -0.05) return vec4(0.0);
+
+    float maxRayDist = max(far * 1.15, 320.0);
+    if (reflectViewDir.z > 0.001) {
+        maxRayDist = min(maxRayDist, (-0.12 - p0.z) / reflectViewDir.z);
+    }
+    if (maxRayDist <= 0.10) return vec4(0.0);
+
+    vec3 p1 = p0 + reflectViewDir * maxRayDist;
+    vec2 uv0 = viewToScreenUV(p0);
+    vec2 uv1 = viewToScreenUV(p1);
+
+    if (uv0.x <= 0.001 || uv0.x >= 0.999 || uv0.y <= 0.001 || uv0.y >= 0.999) {
+        return vec4(0.0);
+    }
+
+    // Clip 2D screen-space segment (uv0 -> uv1) against [0.001, 0.999]^2 so all 72 steps stay on-screen!
+    vec2 dUV = uv1 - uv0;
+    float tClip = 1.0;
+    if (dUV.x > 1e-6)       tClip = min(tClip, (0.999 - uv0.x) / dUV.x);
+    else if (dUV.x < -1e-6) tClip = min(tClip, (0.001 - uv0.x) / dUV.x);
+    if (dUV.y > 1e-6)       tClip = min(tClip, (0.999 - uv0.y) / dUV.y);
+    else if (dUV.y < -1e-6) tClip = min(tClip, (0.001 - uv0.y) / dUV.y);
+    tClip = clamp(tClip, 0.0, 1.0);
+    bool rayExitedViewport = (tClip < 0.995) || (reflectViewDir.z > 0.001);
+
+    vec2 uvEnd = mix(uv0, uv1, tClip);
+    float screenLen = length((uvEnd - uv0) * vec2(fullSize));
+    if (screenLen < 1.0) {
+        needsVoxelFallback = rayExitedViewport;
+        return vec4(0.0);
+    }
+
+    // Dense screen-space stride (4..7px) so hills, trees & shoreline banks are never skipped
+    float targetStride = mix(4.0, 7.0, smoothstep(8.0, 55.0, -p0.z));
+    int steps = clamp(int(ceil(screenLen / targetStride)), 16, 72);
+    float invSteps = 1.0 / float(steps);
+
+    float invZ0 = 1.0 / (-p0.z);
+    float invZ1 = 1.0 / (-p1.z);
+
+    float prevT = 0.0;
+    float prevRayZ = p0.z;
+    bool passedBehindOccluder = false;
+
+    for (int i = 1; i <= 72; i++) {
+        if (i > steps) break;
+
+        float t = ((float(i) - 0.5 + 0.5 * dither) * invSteps) * tClip;
+        vec2 uv = mix(uv0, uv1, t);
+
+        float rayZ = -1.0 / max(mix(invZ0, invZ1, t), 1e-6);
+        ivec2 px = clamp(ivec2(uv * vec2(fullSize)), ivec2(0), fullSize - ivec2(1));
+        float rawD = texelFetch(depthtex0, px, 0).r;
+
+        if (isSceneDepth(rawD)) {
+            vec3 sv = ScreenToView(uv, rawD);
+            if (-sv.z < 0.35) {
+                passedBehindOccluder = true;
+                prevT = t;
+                prevRayZ = rayZ;
+                continue;
+            }
+
+            float diff = sv.z - rayZ;
+            float stepZ = abs(rayZ - prevRayZ);
+            float maxThickness = clamp(stepZ * 2.1 + 0.25 + abs(rayZ) * 0.025, 0.28, 32.0);
+
+            if (diff > -0.06 && diff < maxThickness) {
+                int hitMat = int(texelFetch(colortex1, px, 0).z * 255.0 + 0.5);
+                if (isWaterSurface && isMatWater(hitMat)) {
+                    prevT = t;
+                    prevRayZ = rayZ;
+                    continue;
+                }
+
+                // 6-step binary refinement with strict Reverse-Z sky-depth guard
+                float lo = prevT;
+                float hi = t;
+                vec2 hitUV = uv;
+                ivec2 hitPx = px;
+                float hitDepth = rawD;
+                float hitRayZ = rayZ;
+
+                for (int j = 0; j < 6; j++) {
+                    float mid = 0.5 * (lo + hi);
+                    vec2 midUV = mix(uv0, uv1, mid);
+                    float midRayZ = -1.0 / max(mix(invZ0, invZ1, mid), 1e-6);
+                    ivec2 midPx = clamp(ivec2(midUV * vec2(fullSize)), ivec2(0), fullSize - ivec2(1));
+                    float midD = texelFetch(depthtex0, midPx, 0).r;
+
+                    if (isSceneDepth(midD)) {
+                        int midMat = int(texelFetch(colortex1, midPx, 0).z * 255.0 + 0.5);
+                        if (!(isWaterSurface && isMatWater(midMat))) {
+                            vec3 midSv = ScreenToView(midUV, midD);
+                            if (-midSv.z >= 0.35 && midSv.z > midRayZ) {
+                                hi = mid;
+                                hitUV = midUV;
+                                hitPx = midPx;
+                                hitDepth = midD;
+                                hitRayZ = midRayZ;
+                                continue;
+                            }
+                        }
+                    }
+                    lo = mid;
+                }
+
+                if (!isSceneDepth(hitDepth)) {
+                    prevT = t;
+                    prevRayZ = rayZ;
+                    continue;
+                }
+                int finalMat = int(texelFetch(colortex1, hitPx, 0).z * 255.0 + 0.5);
+                if (isWaterSurface && isMatWater(finalMat)) {
+                    prevT = t;
+                    prevRayZ = rayZ;
+                    continue;
+                }
+
+                vec3 finalSv = ScreenToView(hitUV, hitDepth);
+                float depthErr = abs(finalSv.z - hitRayZ);
+                if (depthErr > maxThickness * 1.65) {
+                    passedBehindOccluder = true;
+                    prevT = t;
+                    prevRayZ = rayZ;
+                    continue;
+                }
+
+                vec3 hitColor = max(vec3(0.0), texelFetch(colortex0, hitPx, 0).rgb);
+                hitColor = applyTerrainFogCompute(hitColor, finalSv, realSunDir);
+
+                float edgeX = smoothstep(0.0, 0.035, hitUV.x) * (1.0 - smoothstep(0.965, 1.0, hitUV.x));
+                float edgeY = smoothstep(0.0, 0.035, hitUV.y) * (1.0 - smoothstep(0.955, 1.0, hitUV.y));
+                float alpha = clamp(edgeX * edgeY, 0.0, 1.0);
+                needsVoxelFallback = (alpha < 0.995);
+                return vec4(hitColor, alpha);
+            } else if (diff >= maxThickness) {
+                passedBehindOccluder = true;
+            }
+        }
+
+        prevT = t;
+        prevRayZ = rayZ;
+    }
+
+    // If ray stayed on-screen all the way to far without hitting or passing behind anything, it saw open sky!
+    needsVoxelFallback = rayExitedViewport || passedBehindOccluder;
+    return vec4(0.0);
+}
+
+vec2 shadowDistortUV(vec2 ndcXY) {
+    float l = length(ndcXY);
+    vec2 d = (l > 0.00001) ? (ndcXY / (l * 0.8 + 0.2)) : ndcXY;
+    return d * 0.5 + 0.5;
+}
+
+float sampleShadowAtWorldRel(vec3 worldRel, vec3 hitNormal) {
+    vec3 biasedRel = worldRel + hitNormal * 0.12;
+    vec4 sClip = shadowProjection * shadowModelView * vec4(biasedRel, 1.0);
+    vec3 sNDC = sClip.xyz / max(abs(sClip.w), 1e-5);
+    if (abs(sNDC.x) > 0.97 || abs(sNDC.y) > 0.97 || sNDC.z < 0.001 || sNDC.z > 0.998) {
+        return 1.0;
+    }
+    vec2 sUV = shadowDistortUV(sNDC.xy);
+    float mapZ = textureLod(shadowtex0, clamp(sUV, vec2(0.001), vec2(0.999)), 0.0).r;
+    return (sNDC.z - 0.0015 <= mapZ) ? 1.0 : 0.0;
+}
+
+vec3 sampleLpvAtAirPos(vec3 airWorldPos, vec3 hitNormal) {
+    vec3 absRel = abs(airWorldPos - cameraPosition);
+    if (max(absRel.x, max(absRel.y, absRel.z)) > 30.0) return vec3(0.0);
+    vec3 lpvUV = fract(airWorldPos / 64.0);
+    vec4 shR = textureLod(uLpvShR, lpvUV, 0.0);
+    vec4 shG = textureLod(uLpvShG, lpvUV, 0.0);
+    vec4 shB = textureLod(uLpvShB, lpvUV, 0.0);
+    if (any(isnan(shR)) || any(isinf(shR))) shR = vec4(0.0);
+    if (any(isnan(shG)) || any(isinf(shG))) shG = vec4(0.0);
+    if (any(isnan(shB)) || any(isinf(shB))) shB = vec4(0.0);
+    vec4 shEval = vec4(0.88622693, -1.02332671 * hitNormal.y, -1.02332671 * hitNormal.z, -1.02332671 * hitNormal.x);
+    vec3 irr = max(vec3(dot(shR, shEval), dot(shG, shEval), dot(shB, shEval)), vec3(0.0));
+    return irr / (vec3(1.0) + irr * 0.14);
+}
+
+float voxelHash(ivec3 c) {
+    uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return float((h ^ (h >> 16u)) & 1023u) * (1.0 / 1023.0);
+}
+
+bool hitSubVoxelRefl(ivec3 cell, vec3 startP, vec3 rayDir, vec3 invDir, ivec3 stepDir, float tEnter, float tExit, out vec3 outSubNormal, out float outHitT) {
+    outSubNormal = -rayDir;
+    outHitT = tEnter;
+    if (tExit <= tEnter) return false;
+    uvec2 bits = texelFetch(uSubVoxelMask, cell & 63, 0).rg;
+    if ((bits.x | bits.y) == 0u) return false;
+
+    vec3 localP = clamp((startP + rayDir * (tEnter + 0.002) - vec3(cell)) * 4.0, vec3(0.0), vec3(3.999));
+    ivec3 sc = ivec3(floor(localP));
+    vec3 nextSub = vec3(sc) + vec3(
+        rayDir.x >= 0.0 ? 1.0 : 0.0,
+        rayDir.y >= 0.0 ? 1.0 : 0.0,
+        rayDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 stMax = abs(nextSub - localP) * invDir;
+    float maxSubT = (tExit - tEnter) * 4.0;
+    float stCurr = 0.0;
+    vec3 lastAxisN = -normalize(rayDir);
+
+    for (int k = 0; k < 12; k++) {
+        uint bitIdx = uint((sc.y << 4) | (sc.z << 2) | sc.x);
+        bool occupied = (bitIdx < 32u)
+            ? ((bits.x & (1u << bitIdx)) != 0u)
+            : ((bits.y & (1u << (bitIdx - 32u))) != 0u);
+        if (occupied) {
+            outSubNormal = lastAxisN;
+            outHitT = tEnter + stCurr * 0.25;
+            return true;
+        }
+        if (stMax.x < stMax.y && stMax.x < stMax.z) {
+            stCurr = stMax.x; stMax.x += invDir.x; sc.x += stepDir.x;
+            lastAxisN = vec3(-float(stepDir.x), 0.0, 0.0);
+        } else if (stMax.y < stMax.z) {
+            stCurr = stMax.y; stMax.y += invDir.y; sc.y += stepDir.y;
+            lastAxisN = vec3(0.0, -float(stepDir.y), 0.0);
+        } else {
+            stCurr = stMax.z; stMax.z += invDir.z; sc.z += stepDir.z;
+            lastAxisN = vec3(0.0, 0.0, -float(stepDir.z));
+        }
+        if (stCurr >= maxSubT || any(lessThan(sc, ivec3(0))) || any(greaterThan(sc, ivec3(3)))) break;
+    }
+    return false;
+}
+
+// Stage 2a — LOD 0: 1m-Exact 64-Step 3D Voxel DDA (0..31m radius)
+bool traceVoxelReflectionLod0(
+    vec3 startWorldPos, vec3 rayDir, vec3 realSunDir, vec3 worldLightDir,
+    vec3 skyCol, vec3 sunCol, float sunInt, float skyLightFactor,
+    out vec3 outColor, out vec3 outTransmittance, out float outExitT
+) {
+    outColor = vec3(0.0);
+    outTransmittance = vec3(1.0);
+    outExitT = 0.0;
+
+    vec3 absStart = abs(startWorldPos - cameraPosition);
+    if (max(absStart.x, max(absStart.y, absStart.z)) > 30.5) {
+        return false;
+    }
+
+    ivec3 cell = ivec3(floor(startWorldPos));
+    ivec3 stepDir = ivec3(sign(rayDir));
+    vec3 invDir = vec3(
+        abs(rayDir.x) > 1e-5 ? (1.0 / abs(rayDir.x)) : 1e6,
+        abs(rayDir.y) > 1e-5 ? (1.0 / abs(rayDir.y)) : 1e6,
+        abs(rayDir.z) > 1e-5 ? (1.0 / abs(rayDir.z)) : 1e6
+    );
+    vec3 nextBound = vec3(cell) + vec3(
+        rayDir.x >= 0.0 ? 1.0 : 0.0,
+        rayDir.y >= 0.0 ? 1.0 : 0.0,
+        rayDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 tMax = abs(nextBound - startWorldPos) * invDir;
+
+    vec3 transmittance = vec3(1.0);
+    float rainClear = 1.0 - saturate(rainStrength);
+
+    for (int s = 0; s < 64; s++) {
+        float tCurr;
+        vec3 hitNormal;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            tCurr = tMax.x; tMax.x += invDir.x; cell.x += stepDir.x;
+            hitNormal = vec3(-float(stepDir.x), 0.0, 0.0);
+        } else if (tMax.y < tMax.z) {
+            tCurr = tMax.y; tMax.y += invDir.y; cell.y += stepDir.y;
+            hitNormal = vec3(0.0, -float(stepDir.y), 0.0);
+        } else {
+            tCurr = tMax.z; tMax.z += invDir.z; cell.z += stepDir.z;
+            hitNormal = vec3(0.0, 0.0, -float(stepDir.z));
+        }
+
+        outExitT = tCurr;
+        vec3 hitWorldPos = startWorldPos + rayDir * tCurr;
+        vec3 hitRel = hitWorldPos - cameraPosition;
+        if (max(abs(hitRel.x), max(abs(hitRel.y), abs(hitRel.z))) > 31.0) {
+            outTransmittance = transmittance;
+            return false;
+        }
+
+        ivec3 tc = cell & 63;
+        uint mask = texelFetch(uVoxelMask, tc, 0).r & 0x7Fu;
+        vec4 em = texelFetch(uEmissiveTex, tc, 0);
+
+        if (em.a > 0.004) {
+            outColor = em.rgb * (em.a * 4.0 * 1.45) * transmittance;
+            outTransmittance = transmittance;
+            return true;
+        }
+
+        if (mask == 1u || mask == 19u) {
+            bool isLeaf = (mask == 19u);
+            uint palId = texelFetch(uVoxelPalette, tc, 0).r;
+            vec3 baseAlbedo = max(em.rgb, isLeaf ? vec3(0.05, 0.18, 0.04) : vec3(0.08));
+            vec3 albedo = sampleRealBlockAtlasAlbedo(palId, baseAlbedo, hitWorldPos, hitNormal, isLeaf);
+
+            float rawNdotL = dot(hitNormal, worldLightDir);
+            float NdotL = isLeaf ? clamp((rawNdotL + 0.45) / 1.45, 0.0, 1.0) : max(rawNdotL, 0.0);
+            float sh = (NdotL > 0.001) ? sampleShadowAtWorldRel(hitRel, hitNormal) : 0.0;
+            vec3 direct = sunCol * (sunInt * (2.6 * rainClear + 0.20) * NdotL * sh);
+            if (isLeaf && sh > 0.1) {
+                direct += sunCol * (sunInt * 0.24 * rainClear * sh);
+            }
+
+            vec3 lpvIrr = sampleLpvAtAirPos(hitWorldPos + hitNormal * 0.48, hitNormal);
+            vec3 skyAmb = skyCol * (mix(0.14, 0.26, saturate(hitNormal.y * 0.5 + 0.5)) * skyLightFactor);
+
+            vec3 hitViewPos = (gbufferModelView * vec4(hitRel, 1.0)).xyz;
+            vec3 lit = albedo * (direct + skyAmb + lpvIrr * 1.15);
+            outColor = applyTerrainFogCompute(lit, hitViewPos, realSunDir) * transmittance;
+            outTransmittance = transmittance;
+            return true;
+        } else if (mask == 18u) {
+            float tExit = min(tMax.x, min(tMax.y, tMax.z));
+            vec3 subN;
+            float subT;
+            if (hitSubVoxelRefl(cell, startWorldPos, rayDir, invDir, stepDir, tCurr, tExit, subN, subT)) {
+                vec3 subHitPos = startWorldPos + rayDir * subT;
+                vec3 subHitRel = subHitPos - cameraPosition;
+                uint palId = texelFetch(uVoxelPalette, tc, 0).r;
+                vec3 rawSub = (em.r + em.g + em.b > 0.02) ? em.rgb : vec3(0.34, 0.32, 0.30);
+                vec3 albedo = sampleRealBlockAtlasAlbedo(palId, rawSub, subHitPos, subN, false);
+                float NdotL = max(dot(subN, worldLightDir), 0.0);
+                float sh = (NdotL > 0.001) ? sampleShadowAtWorldRel(subHitRel, subN) : 0.0;
+                vec3 direct = sunCol * (sunInt * (2.6 * rainClear + 0.20) * NdotL * sh);
+                vec3 lpvIrr = sampleLpvAtAirPos(subHitPos + subN * 0.35, subN);
+                vec3 skyAmb = skyCol * (0.20 * skyLightFactor);
+                vec3 subViewPos = (gbufferModelView * vec4(subHitRel, 1.0)).xyz;
+                outColor = applyTerrainFogCompute(albedo * (direct + skyAmb + lpvIrr * 1.10), subViewPos, realSunDir) * transmittance;
+                outTransmittance = transmittance;
+                return true;
+            }
+        } else if (mask >= 2u && mask <= 17u) {
+            transmittance *= STAINED_GLASS_TINT[mask - 2u];
+        }
+    }
+
+    outTransmittance = transmittance;
+    return false;
+}
+
+// Stage 2b — LOD 1: 2m Macro-Voxel Clipmap 3D DDA (128x64x128 -> +-128m XZ, +-64m Y, 2x sharper!)
+bool traceFarVoxelReflectionLod1(
+    vec3 startWorldPos, vec3 rayDir, float startT, vec3 realSunDir, vec3 worldLightDir,
+    vec3 skyCol, vec3 sunCol, float sunInt, float skyLightFactor, vec3 skyFallback,
+    out vec3 outColor
+) {
+    outColor = vec3(0.0);
+    vec3 worldP = startWorldPos + rayDir * max(startT, 0.25);
+    vec3 absStart = abs(worldP - cameraPosition);
+    if (max(absStart.x, absStart.z) > 122.0 || absStart.y > 60.0) {
+        return false;
+    }
+
+    // Operate in 2m voxel coordinates (1 cell = 2x2x2 world meters)
+    vec3 mStart = worldP * 0.5;
+    ivec3 mCell = ivec3(floor(mStart));
+    ivec3 stepDir = ivec3(sign(rayDir));
+    vec3 invDir = vec3(
+        abs(rayDir.x) > 1e-5 ? (1.0 / abs(rayDir.x)) : 1e6,
+        abs(rayDir.y) > 1e-5 ? (1.0 / abs(rayDir.y)) : 1e6,
+        abs(rayDir.z) > 1e-5 ? (1.0 / abs(rayDir.z)) : 1e6
+    );
+    vec3 nextBound = vec3(mCell) + vec3(
+        rayDir.x >= 0.0 ? 1.0 : 0.0,
+        rayDir.y >= 0.0 ? 1.0 : 0.0,
+        rayDir.z >= 0.0 ? 1.0 : 0.0
+    );
+    vec3 tMax = abs(nextBound - mStart) * invDir;
+    float rainClear = 1.0 - saturate(rainStrength);
+
+    for (int s = 0; s < 64; s++) {
+        float tMacro;
+        vec3 hitNormal;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            tMacro = tMax.x; tMax.x += invDir.x; mCell.x += stepDir.x;
+            hitNormal = vec3(-float(stepDir.x), 0.0, 0.0);
+        } else if (tMax.y < tMax.z) {
+            tMacro = tMax.y; tMax.y += invDir.y; mCell.y += stepDir.y;
+            hitNormal = vec3(0.0, -float(stepDir.y), 0.0);
+        } else {
+            tMacro = tMax.z; tMax.z += invDir.z; mCell.z += stepDir.z;
+            hitNormal = vec3(0.0, 0.0, -float(stepDir.z));
+        }
+
+        float worldDist = startT + tMacro * 2.0;
+        vec3 hitWorldPos = startWorldPos + rayDir * worldDist;
+        vec3 hitRel = hitWorldPos - cameraPosition;
+        float maxHoriz = max(abs(hitRel.x), abs(hitRel.z));
+        if (maxHoriz > 124.0 || abs(hitRel.y) > 62.0) {
+            return false;
+        }
+
+        ivec3 tc = ivec3(mCell.x & 127, mCell.y & 63, mCell.z & 127);
+        vec4 fv = texelFetch(uFarVoxelTex, tc, 0);
+        if (fv.a > 0.25) {
+            if (fv.a > 0.85) {
+                outColor = fv.rgb * 2.8;
+            } else {
+                bool isLeaf = (fv.a > 0.56);
+                uint farPalId = texelFetch(uFarPalette, tc, 0).r;
+                vec3 baseAlbedo = max(fv.rgb, isLeaf ? vec3(0.05, 0.18, 0.04) : vec3(0.08));
+                vec3 albedo = sampleRealBlockAtlasAlbedo(farPalId, baseAlbedo, hitWorldPos, hitNormal, isLeaf);
+
+                float rawNdotL = dot(hitNormal, worldLightDir);
+                float NdotL = clamp((rawNdotL + (isLeaf ? 0.50 : 0.25)) / (isLeaf ? 1.50 : 1.25), 0.0, 1.0);
+                float sh = (NdotL > 0.001) ? sampleShadowAtWorldRel(hitRel, hitNormal) : 0.0;
+                vec3 direct = sunCol * (sunInt * (2.4 * rainClear + 0.20) * NdotL * sh);
+                vec3 skyAmb = skyCol * (mix(0.16, 0.28, saturate(hitNormal.y * 0.5 + 0.5)) * skyLightFactor);
+
+                vec3 hitViewPos = (gbufferModelView * vec4(hitRel, 1.0)).xyz;
+                vec3 lit = applyTerrainFogCompute(albedo * (direct + skyAmb), hitViewPos, realSunDir);
+                float farFade = smoothstep(82.0, 124.0, maxHoriz);
+                outColor = mix(lit, skyFallback, farFade);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    ivec2 outSize = imageSize(uReflOut);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= outSize.x || gid.y >= outSize.y) return;
+
+    float existingGTAO = texelFetch(colortex9In, gid, 0).a;
+    vec2 uv = (vec2(gid) + 0.5) / vec2(max(outSize, ivec2(1)));
+    ivec2 fullSize = max(textureSize(depthtex0, 0), ivec2(1));
+    ivec2 fullPx = clamp(ivec2(uv * vec2(fullSize)), ivec2(0), fullSize - ivec2(1));
+    float rawDepth = texelFetch(depthtex0, fullPx, 0).r;
+    if (!isSceneDepth(rawDepth)) {
+        imageStore(uReflOut, gid, vec4(0.0, 0.0, 0.0, existingGTAO));
+        return;
+    }
+
+    vec4 c1 = texelFetch(colortex1, fullPx, 0);
+    int blockId = int(c1.z * 255.0 + 0.5);
+    float skyLightData = c1.a;
+    bool isWater = isMatWater(blockId);
+    bool isGlass = isMatTranslucentNonWater(blockId);
+    bool underwater = (isEyeInWater == 1);
+
+    vec3 geomWorldN = octDecode(c1.rg);
+    bool isWetFloor = (!isWater && !isGlass && !underwater && rainStrength > 0.01
+                       && geomWorldN.y > 0.45 && skyLightData > 0.60);
+
+    if (!isWater && !isGlass && !isWetFloor) {
+        imageStore(uReflOut, gid, vec4(0.0, 0.0, 0.0, existingGTAO));
+        return;
+    }
+
+    vec2 unjitteredUV = clamp(uv - taaJitter * 0.5, vec2(0.001), vec2(0.999));
+    vec3 viewPos = ScreenToView(unjitteredUV, rawDepth);
+    vec3 worldRel = (gbufferModelViewInverse * vec4(viewPos, 1.0)).xyz;
+    vec3 worldPos = worldRel + cameraPosition;
+    vec3 worldViewDir = normalize(worldRel);
+
+    vec3 realSunDir = normalize((gbufferModelViewInverse * vec4(sunPosition, 0.0)).xyz);
+    vec3 worldLightDir = (realSunDir.y >= 0.0) ? realSunDir : -realSunDir;
+    vec3 skyCol, sunCol;
+    float dayFac, sunInt;
+    computeUnifiedLighting(realSunDir, skyCol, sunCol, dayFac, sunInt);
+    float nightDim = mix(0.05, 1.0, saturate(realSunDir.y * 4.0 + 0.5));
+    float skyLightFactor = smoothstep(0.06, 0.88, skyLightData);
+
+    // Compute world-space reflection normal & direction
+    vec3 flatWorldN = isWater ? (underwater ? vec3(0.0, -1.0, 0.0) : vec3(0.0, 1.0, 0.0)) : geomWorldN;
+    vec3 reflWorldN = geomWorldN;
+    if (isWater) {
+        vec3 waveWorldN = octDecode(textureLod(colortex3, uv, 0.0).rg);
+        reflWorldN = normalize(mix(flatWorldN, waveWorldN, underwater ? 0.38 : 0.48));
+    }
+
+    vec3 reflectWorldDir = normalize(reflect(worldViewDir, reflWorldN));
+    if (isWater && !underwater && reflectWorldDir.y < 0.015) {
+        reflectWorldDir = normalize(vec3(reflectWorldDir.x, 0.015, reflectWorldDir.z));
+    }
+    vec3 reflectViewDir = normalize(mat3(gbufferModelView) * reflectWorldDir);
+
+    float dither = interleavedGradientNoise(vec2(gid) + 0.5);
+
+    // =========================================================================
+    // Stage 1: SEUS PTGI-Style Viewport-Clipped Full-Render-Distance Screen-Space Trace
+    // =========================================================================
+    vec4 ssrHit = vec4(0.0);
+    bool needsVoxelFallback = true;
+    if (!underwater || !isWater) {
+        ssrHit = traceScreenSpacePrimary(
+            viewPos, reflectViewDir, realSunDir, fullSize, dither, isWater, needsVoxelFallback
+        );
+    }
+
+    vec3 reflection;
+    if (ssrHit.a >= 0.995) {
+        reflection = ssrHit.rgb;
+    } else {
+        // =====================================================================
+        // Stage 3 (Precomputed): Horizon-Tamed Sky LUT + Volumetric Clouds
+        // =====================================================================
+        vec3 skyFallback;
+        if (isWater && underwater) {
+            float depthGrad = saturate(-reflectWorldDir.y * 0.5 + 0.5);
+            skyFallback = mix(vec3(0.022, 0.165, 0.148), vec3(0.012, 0.095, 0.088), depthGrad) * nightDim;
+            skyFallback *= mix(0.28, 1.0, skyLightFactor);
+        } else {
+            vec3 skyReflDir = normalize(vec3(reflectWorldDir.x, max(reflectWorldDir.y, 0.03), reflectWorldDir.z));
+            vec3 skyRefl = sampleSkyLUT(skyReflDir);
+
+            // Reflect real volumetric clouds into water & glass (fast 14-step trace)
+            if (skyLightFactor > 0.10 && skyReflDir.y > 0.03) {
+                vec3 skyZenithLUT  = sampleSkyLUT(vec3(0.0, 0.95, 0.0));
+                vec3 skyHorizonLUT = sampleSkyLUT(normalize(vec3(skyReflDir.x, 0.10, skyReflDir.z)));
+                vec3 skySunSideLUT = sampleSkyLUT(normalize(vec3(realSunDir.x, max(realSunDir.y, 0.08), realSunDir.z)));
+                vec4 volCloud = traceVolumetricClouds(
+                    skyReflDir, realSunDir, skyRefl, skyZenithLUT, skyHorizonLUT, skySunSideLUT,
+                    realSunDir.y, saturate(rainStrength), frameTimeCounter, false
+                );
+                skyRefl = skyRefl * volCloud.a + volCloud.rgb;
+            }
+
+            if (isWater) {
+                vec3 upperSky = sampleSkyLUT(normalize(vec3(skyReflDir.x, max(skyReflDir.y + 0.30, 0.34), skyReflDir.z)));
+                float horizonMask = 1.0 - smoothstep(0.02, 0.26, skyReflDir.y);
+                skyRefl = mix(skyRefl, upperSky * 0.88, horizonMask * 0.55);
+                skyRefl = skyRefl / (vec3(1.0) + skyRefl * 0.34);
+                skyRefl *= mix(0.74, 0.96, smoothstep(0.0, 0.30, skyReflDir.y));
+                skyRefl *= mix(1.0, 0.70, saturate(rainStrength));
+            }
+            vec3 indoorAmbient = vec3(0.004, 0.008, 0.014) * nightDim;
+            skyFallback = mix(indoorAmbient, skyRefl, skyLightFactor);
+        }
+
+        vec3 fallbackRefl = skyFallback;
+        // =====================================================================
+        // Stage 2: 3D Voxel RT Fallback ONLY when ray exited viewport or was occluded!
+        //   Prevents coarse 4m macro-voxels from ever bleeding into visible on-screen sky/hills.
+        // =====================================================================
+        if (needsVoxelFallback) {
+            vec3 startWorldPos = worldPos + flatWorldN * (isWater ? 0.06 : 0.05);
+            vec3 rtColor, transmittance;
+            float exitT;
+            bool hitLod0 = traceVoxelReflectionLod0(
+                startWorldPos, reflectWorldDir, realSunDir, worldLightDir,
+                skyCol, sunCol, sunInt, skyLightFactor,
+                rtColor, transmittance, exitT
+            );
+
+            if (hitLod0) {
+                fallbackRefl = rtColor;
+            } else {
+                vec3 farColor;
+                bool hitLod1 = traceFarVoxelReflectionLod1(
+                    startWorldPos, reflectWorldDir, exitT, realSunDir, worldLightDir,
+                    skyCol, sunCol, sunInt, skyLightFactor, skyFallback,
+                    farColor
+                );
+                fallbackRefl = (hitLod1 ? farColor : skyFallback) * transmittance;
+            }
+        }
+
+        // Seamless cross-fade: crisp SSR inside viewport -> 3D Voxel RT + Clouds at borders/off-screen
+        reflection = mix(fallbackRefl, ssrHit.rgb, ssrHit.a);
+    }
+
+    if (isWater && !underwater) {
+        reflection *= mix(vec3(1.0), vec3(0.88, 0.98, 0.95), 0.24);
+    }
+
+    if (any(isnan(reflection)) || any(isinf(reflection))) {
+        reflection = vec3(0.0);
+    }
+    imageStore(uReflOut, gid, vec4(clamp(reflection, vec3(0.0), vec3(12.0)), existingGTAO));
+}

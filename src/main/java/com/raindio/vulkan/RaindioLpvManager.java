@@ -17,13 +17,30 @@ import com.raindio.mixin.VulkanCommandEncoderAccessor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
+import java.nio.ShortBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
+import net.minecraft.client.color.block.BlockTintSource;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
+import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.resources.model.geometry.BakedQuad;
+import net.minecraft.client.resources.model.sprite.Material;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -84,6 +101,17 @@ public final class RaindioLpvManager implements AutoCloseable {
     private static final int MASK_BYTES = VOXEL_COUNT;                        // 256 KB (R8_UINT)
     private static final int EMISSIVE_BYTES = VOXEL_COUNT * 4;                // 1 MB (RGBA8_UNORM)
     private static final int SUBVOXEL_BYTES = VOXEL_COUNT * 8;                // 2 MB (R32G32_UINT, 4x4x4 = 64 bits/block)
+    private static final int FAR_XZ = 128;
+    private static final int FAR_Y = 64;
+    private static final int FAR_XZ_MASK = FAR_XZ - 1;
+    private static final int FAR_Y_MASK = FAR_Y - 1;
+    private static final int FAR_VOXEL_COUNT = FAR_XZ * FAR_Y * FAR_XZ;
+    private static final int FAR_VOXEL_BYTES = FAR_VOXEL_COUNT * 4;           // 4 MB (RGBA8_UNORM, 2m/voxel -> 256x128x256m RT reflections)
+    private static final int PALETTE_MAX = 1024;
+    private static final int PALETTE_LUT_FLOATS = PALETTE_MAX * 3 * 4;        // 1024x3 RGBA32F (48 KB: row0=topUV, row1=sideUV, row2=tintRGB+flags)
+    private static final int PALETTE_LUT_BYTES = PALETTE_LUT_FLOATS * 4;
+    private static final int VOXEL_PALETTE_BYTES = VOXEL_COUNT * 2;           // 512 KB (R16_UINT, LOD 0 block palette IDs)
+    private static final int FAR_PALETTE_BYTES = FAR_VOXEL_COUNT * 2;         // 2 MB (R16_UINT, LOD 1 block palette IDs)
     private static final int RING_SIZE = 4;
     private static final int MAX_PROPAGATION_STEPS = 8;
 
@@ -91,15 +119,31 @@ public final class RaindioLpvManager implements AutoCloseable {
     private final byte[] cpuMask = new byte[MASK_BYTES];
     private final byte[] cpuEmissive = new byte[EMISSIVE_BYTES];
     private final int[] cpuSubVoxel = new int[VOXEL_COUNT * 2];
+    private final byte[] cpuFarVoxel = new byte[FAR_VOXEL_BYTES];
+    private final short[] cpuVoxelPalette = new short[VOXEL_COUNT];
+    private final short[] cpuFarPalette = new short[FAR_VOXEL_COUNT];
+    private final float[] cpuPaletteLut = new float[PALETTE_LUT_FLOATS];
+    private final Map<BlockState, Integer> paletteMap = new HashMap<>(256);
+    private final List<BlockStateModelPart> palettePartsScratch = new ArrayList<>(4);
+    private final RandomSource paletteRandom = RandomSource.create(42L);
+    private int nextPaletteId = 1;
     private final BlockPos.MutableBlockPos scratchPos = new BlockPos.MutableBlockPos();
     private final int[] subBitsScratch = new int[2];
     private ClientLevel lastLevel = null;
     private int originX = Integer.MIN_VALUE;
     private int originY = Integer.MIN_VALUE;
     private int originZ = Integer.MIN_VALUE;
+    private int farOriginX = Integer.MIN_VALUE;
+    private int farOriginY = Integer.MIN_VALUE;
+    private int farOriginZ = Integer.MIN_VALUE;
+    private int farRefreshCursor = 0;
     private boolean maskDirty = false;
     private boolean emissiveDirty = false;
     private boolean subVoxelDirty = false;
+    private boolean farVoxelDirty = false;
+    private boolean voxelPaletteDirty = false;
+    private boolean farPaletteDirty = false;
+    private boolean paletteLutDirty = false;
     private boolean hasStaleWrapFlags = false;
     private boolean needsShClear = true;
     private int heldVoxelX = Integer.MIN_VALUE;
@@ -123,16 +167,28 @@ public final class RaindioLpvManager implements AutoCloseable {
     private long nearestRepeatSampler = VK12.VK_NULL_HANDLE;
     private long linearRepeatSampler = VK12.VK_NULL_HANDLE;
 
-    // 3D Voxel Mask (R8_UINT) + Emissive (RGBA8_UNORM) + 4x4x4 Sub-Voxel Mask (R32G32_UINT) + Host staging buffers
+    // 3D Voxel Mask + Emissive + 4x4x4 Sub-Voxel + 2m Far Clipmap + Palette-Indexed Block Atlas LUT
     private long maskImage = VK12.VK_NULL_HANDLE, maskAlloc = 0L, maskView = VK12.VK_NULL_HANDLE;
     private long emImage = VK12.VK_NULL_HANDLE, emAlloc = 0L, emView = VK12.VK_NULL_HANDLE;
     private long subVoxelImage = VK12.VK_NULL_HANDLE, subVoxelAlloc = 0L, subVoxelView = VK12.VK_NULL_HANDLE;
+    private long farVoxelImage = VK12.VK_NULL_HANDLE, farVoxelAlloc = 0L, farVoxelView = VK12.VK_NULL_HANDLE;
+    private long paletteLutImage = VK12.VK_NULL_HANDLE, paletteLutAlloc = 0L, paletteLutView = VK12.VK_NULL_HANDLE;
+    private long voxelPaletteImage = VK12.VK_NULL_HANDLE, voxelPaletteAlloc = 0L, voxelPaletteView = VK12.VK_NULL_HANDLE;
+    private long farPaletteImage = VK12.VK_NULL_HANDLE, farPaletteAlloc = 0L, farPaletteView = VK12.VK_NULL_HANDLE;
     private final long[] maskStagingBufs = new long[RING_SIZE];
     private final long[] maskStagingAllocs = new long[RING_SIZE];
     private final long[] emStagingBufs = new long[RING_SIZE];
     private final long[] emStagingAllocs = new long[RING_SIZE];
     private final long[] subVoxelStagingBufs = new long[RING_SIZE];
     private final long[] subVoxelStagingAllocs = new long[RING_SIZE];
+    private final long[] farVoxelStagingBufs = new long[RING_SIZE];
+    private final long[] farVoxelStagingAllocs = new long[RING_SIZE];
+    private final long[] paletteLutStagingBufs = new long[RING_SIZE];
+    private final long[] paletteLutStagingAllocs = new long[RING_SIZE];
+    private final long[] voxelPaletteStagingBufs = new long[RING_SIZE];
+    private final long[] voxelPaletteStagingAllocs = new long[RING_SIZE];
+    private final long[] farPaletteStagingBufs = new long[RING_SIZE];
+    private final long[] farPaletteStagingAllocs = new long[RING_SIZE];
 
     // Ping-pong 3D L1 SH volumes: [0]=A, [1]=B
     private final long[] shRImg = new long[2], shRAlloc = new long[2], shRView = new long[2];
@@ -145,7 +201,10 @@ public final class RaindioLpvManager implements AutoCloseable {
     private boolean unavailable = false;
 
     public boolean isReady() {
-        return initialized && !unavailable && shRView[activeShIndex] != VK12.VK_NULL_HANDLE && subVoxelView != VK12.VK_NULL_HANDLE;
+        return initialized && !unavailable && shRView[activeShIndex] != VK12.VK_NULL_HANDLE
+                && subVoxelView != VK12.VK_NULL_HANDLE && farVoxelView != VK12.VK_NULL_HANDLE
+                && paletteLutView != VK12.VK_NULL_HANDLE && voxelPaletteView != VK12.VK_NULL_HANDLE
+                && farPaletteView != VK12.VK_NULL_HANDLE;
     }
 
     public long shRView() { return shRView[activeShIndex]; }
@@ -153,6 +212,10 @@ public final class RaindioLpvManager implements AutoCloseable {
     public long shBView() { return shBView[activeShIndex]; }
     public long voxelMaskView() { return maskView; }
     public long subVoxelView() { return subVoxelView; }
+    public long farVoxelView() { return farVoxelView; }
+    public long blockPaletteLutView() { return paletteLutView; }
+    public long voxelPaletteView() { return voxelPaletteView; }
+    public long farPaletteView() { return farPaletteView; }
     public long emissiveView() { return emView; }
     public long linearRepeatSampler() { return linearRepeatSampler; }
     public long nearestRepeatSampler() { return nearestRepeatSampler; }
@@ -216,6 +279,12 @@ public final class RaindioLpvManager implements AutoCloseable {
                 || (Math.abs(newOriginZ - originZ) >= 16);
 
         if (fullRebuild) {
+            if (level != lastLevel) {
+                paletteMap.clear();
+                Arrays.fill(cpuPaletteLut, 0.0f);
+                nextPaletteId = 1;
+                paletteLutDirty = true;
+            }
             this.lastLevel = level;
             this.originX = newOriginX;
             this.originY = newOriginY;
@@ -225,7 +294,9 @@ public final class RaindioLpvManager implements AutoCloseable {
             this.maskDirty = true;
             this.emissiveDirty = true;
             this.subVoxelDirty = true;
+            this.voxelPaletteDirty = true;
             this.needsShClear = true;
+            updateFarVoxels(level, px, py, pz, true);
             return;
         }
 
@@ -261,6 +332,288 @@ public final class RaindioLpvManager implements AutoCloseable {
         // walls, stained glass, torches, or sea lanterns reflects in LPV immediately —
         // only uploading 3D textures to VRAM if at least one byte actually changed!
         scanBox(level, px - 3, py - 3, pz - 3, px + 4, py + 4, pz + 4, false);
+        updateFarVoxels(level, px, py, pz, false);
+    }
+
+    /**
+     * Maintains LOD 1 (128x64x128 @ 2m/voxel = 256x128x256m / +-128m horizontal) toroidal clipmap.
+     * 2x finer geometry than 4m cells; only scans newly entered 2m slabs + 3 rolling chunk columns/frame.
+     */
+    private void updateFarVoxels(ClientLevel level, int px, int py, int pz, boolean forceFull) {
+        int newFarX = (px >> 1) - (FAR_XZ / 2);
+        int newFarY = (py >> 1) - (FAR_Y / 2);
+        int newFarZ = (pz >> 1) - (FAR_XZ / 2);
+        boolean full = forceFull || (farOriginX == Integer.MIN_VALUE)
+                || Math.abs(newFarX - farOriginX) >= 16
+                || Math.abs(newFarY - farOriginY) >= 12
+                || Math.abs(newFarZ - farOriginZ) >= 16;
+        if (full) {
+            this.farOriginX = newFarX;
+            this.farOriginY = newFarY;
+            this.farOriginZ = newFarZ;
+            scanFarBox(level, farOriginX, farOriginY, farOriginZ, farOriginX + FAR_XZ, farOriginY + FAR_Y, farOriginZ + FAR_XZ);
+            this.farVoxelDirty = true;
+            return;
+        }
+        int dx = newFarX - farOriginX;
+        int dy = newFarY - farOriginY;
+        int dz = newFarZ - farOriginZ;
+        if (dx != 0) {
+            int x0 = dx > 0 ? (farOriginX + FAR_XZ) : newFarX;
+            int x1 = dx > 0 ? (newFarX + FAR_XZ) : farOriginX;
+            scanFarBox(level, x0, newFarY, newFarZ, x1, newFarY + FAR_Y, newFarZ + FAR_XZ);
+        }
+        if (dy != 0) {
+            int y0 = dy > 0 ? (farOriginY + FAR_Y) : newFarY;
+            int y1 = dy > 0 ? (newFarY + FAR_Y) : farOriginY;
+            scanFarBox(level, newFarX, y0, newFarZ, newFarX + FAR_XZ, y1, newFarZ + FAR_XZ);
+        }
+        if (dz != 0) {
+            int z0 = dz > 0 ? (farOriginZ + FAR_XZ) : newFarZ;
+            int z1 = dz > 0 ? (newFarZ + FAR_XZ) : farOriginZ;
+            scanFarBox(level, newFarX, newFarY, z0, newFarX + FAR_XZ, newFarY + FAR_Y, z1);
+        }
+        this.farOriginX = newFarX;
+        this.farOriginY = newFarY;
+        this.farOriginZ = newFarZ;
+
+        // Rolling background refresh (3 chunk columns/frame across the 16x16 far chunk grid) so newly
+        // streamed-in distant chunks are always populated in uFarVoxelTex with zero chunk-boundary cutoffs.
+        for (int k = 0; k < 3; k++) {
+            int cIdx = (farRefreshCursor++) & 255;
+            int lx = (cIdx & 15) << 3;
+            int lz = ((cIdx >> 4) & 15) << 3;
+            scanFarBox(level, farOriginX + lx, farOriginY, farOriginZ + lz,
+                    farOriginX + lx + 8, farOriginY + FAR_Y, farOriginZ + lz + 8);
+        }
+    }
+
+    private void scanFarBox(ClientLevel level, int minMX, int minMY, int minMZ, int maxMX, int maxMY, int maxMZ) {
+        int worldMinY = level.getMinY();
+        int worldMaxY = worldMinY + level.getHeight();
+        int minCX = (minMX << 1) >> 4;
+        int maxCX = ((maxMX - 1) << 1) >> 4;
+        int minCZ = (minMZ << 1) >> 4;
+        int maxCZ = ((maxMZ - 1) << 1) >> 4;
+        int minSY = Math.max(worldMinY, minMY << 1) >> 4;
+        int maxSY = (Math.min(worldMaxY, maxMY << 1) - 1) >> 4;
+
+        for (int cx = minCX; cx <= maxCX; cx++) {
+            int mxStart = Math.max(minMX, cx << 3);
+            int mxEnd = Math.min(maxMX, (cx << 3) + 8);
+            for (int cz = minCZ; cz <= maxCZ; cz++) {
+                int mzStart = Math.max(minMZ, cz << 3);
+                int mzEnd = Math.min(maxMZ, (cz << 3) + 8);
+                LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+                LevelChunkSection[] sections = (chunk != null) ? chunk.getSections() : null;
+
+                if ((minMY << 1) < worldMinY) {
+                    clearFarAirBox(mxStart, minMY, mzStart, mxEnd, Math.min(maxMY, worldMinY >> 1), mzEnd);
+                }
+                if ((maxMY << 1) > worldMaxY) {
+                    clearFarAirBox(mxStart, Math.max(minMY, worldMaxY >> 1), mzStart, mxEnd, maxMY, mzEnd);
+                }
+
+                for (int sy = minSY; sy <= maxSY; sy++) {
+                    int myStart = Math.max(minMY, sy << 3);
+                    int myEnd = Math.min(maxMY, (sy << 3) + 8);
+                    LevelChunkSection sec = null;
+                    if (sections != null) {
+                        int sIdx = level.getSectionIndexFromSectionY(sy);
+                        if (sIdx >= 0 && sIdx < sections.length) sec = sections[sIdx];
+                    }
+                    if (sec == null || sec.hasOnlyAir()) {
+                        clearFarAirBox(mxStart, myStart, mzStart, mxEnd, myEnd, mzEnd);
+                        continue;
+                    }
+
+                    for (int my = myStart; my < myEnd; my++) {
+                        int ty = my & FAR_Y_MASK;
+                        int by = (my & 7) << 1;
+                        for (int mz = mzStart; mz < mzEnd; mz++) {
+                            int tz = mz & FAR_XZ_MASK;
+                            int bz = (mz & 7) << 1;
+                            int rowOff = (tz * FAR_Y + ty) * FAR_XZ;
+                            for (int mx = mxStart; mx < mxEnd; mx++) {
+                                int bx = (mx & 7) << 1;
+                                int idx = rowOff + (mx & FAR_XZ_MASK);
+                                sampleFarMacroCell(sec, bx, by, bz, idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void clearFarAirBox(int x0, int y0, int z0, int x1, int y1, int z1) {
+        for (int my = y0; my < y1; my++) {
+            int ty = my & FAR_Y_MASK;
+            for (int mz = z0; mz < z1; mz++) {
+                int tz = mz & FAR_XZ_MASK;
+                int rowOff = (tz * FAR_Y + ty) * FAR_XZ;
+                for (int mx = x0; mx < x1; mx++) {
+                    int idx = rowOff + (mx & FAR_XZ_MASK);
+                    int o = idx * 4;
+                    if (cpuFarVoxel[o] != 0 || cpuFarVoxel[o + 1] != 0 || cpuFarVoxel[o + 2] != 0 || cpuFarVoxel[o + 3] != 0) {
+                        cpuFarVoxel[o] = 0; cpuFarVoxel[o + 1] = 0; cpuFarVoxel[o + 2] = 0; cpuFarVoxel[o + 3] = 0;
+                        farVoxelDirty = true;
+                    }
+                    if (cpuFarPalette[idx] != 0) {
+                        cpuFarPalette[idx] = 0;
+                        farPaletteDirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private static final int[] FAR_TAP_X = { 0, 1, 1, 0 };
+    private static final int[] FAR_TAP_Y = { 1, 0, 1, 0 };
+    private static final int[] FAR_TAP_Z = { 0, 1, 0, 1 };
+
+    private void sampleFarMacroCell(LevelChunkSection sec, int bx, int by, int bz, int idx) {
+        byte outR = 0, outG = 0, outB = 0, outA = 0;
+        short outPal = 0;
+        for (int t = 0; t < 4; t++) {
+            BlockState st = sec.getBlockState(bx + FAR_TAP_X[t], by + FAR_TAP_Y[t], bz + FAR_TAP_Z[t]);
+            if (st.isAir() || !st.getFluidState().isEmpty()) continue;
+            Block b = st.getBlock();
+            int em = st.getLightEmission();
+            if (em >= 6) {
+                float[] spec = classifyEmissive(b, em);
+                outR = toUByte(spec[0] * curPlTint[0]);
+                outG = toUByte(spec[1] * curPlTint[1]);
+                outB = toUByte(spec[2] * curPlTint[2]);
+                outA = (byte) 250;
+                break;
+            }
+            if ((st.canOcclude() && st.isSolidRender()) || (b instanceof LeavesBlock)) {
+                int col = b.defaultMapColor().col;
+                float r = ((col >> 16) & 0xFF) / 255.0f;
+                float g = ((col >> 8) & 0xFF) / 255.0f;
+                float bl = (col & 0xFF) / 255.0f;
+                float lum = 0.2126f * r + 0.7152f * g + 0.0722f * bl;
+                float sat = (b instanceof LeavesBlock) ? 1.25f : 1.45f;
+                r = Math.max(0.0f, Math.min(1.0f, lum + (r - lum) * sat));
+                g = Math.max(0.0f, Math.min(1.0f, lum + (g - lum) * sat));
+                bl = Math.max(0.0f, Math.min(1.0f, lum + (bl - lum) * sat));
+                outR = toUByte((float) Math.pow(r, 1.5));
+                outG = toUByte((float) Math.pow(g, 1.5));
+                outB = toUByte((float) Math.pow(bl, 1.5));
+                outA = (byte) ((b instanceof LeavesBlock) ? 160 : 128);
+                outPal = resolveBlockPaletteId(st);
+                break;
+            }
+        }
+        int o = idx * 4;
+        if (cpuFarVoxel[o] != outR || cpuFarVoxel[o + 1] != outG || cpuFarVoxel[o + 2] != outB || cpuFarVoxel[o + 3] != outA) {
+            cpuFarVoxel[o] = outR; cpuFarVoxel[o + 1] = outG; cpuFarVoxel[o + 2] = outB; cpuFarVoxel[o + 3] = outA;
+            farVoxelDirty = true;
+        }
+        if (cpuFarPalette[idx] != outPal) {
+            cpuFarPalette[idx] = outPal;
+            farPaletteDirty = true;
+        }
+    }
+
+    /**
+     * Resolves a unique BlockState into a compact 1..1023 palette ID and records its live
+     * Minecraft TextureAtlasSprite UVs (top & side faces) plus BlockColors tint into cpuPaletteLut.
+     */
+    private short resolveBlockPaletteId(BlockState state) {
+        Integer cached = paletteMap.get(state);
+        if (cached != null) return cached.shortValue();
+        if (nextPaletteId >= PALETTE_MAX) return 0;
+
+        int id = nextPaletteId++;
+        paletteMap.put(state, id);
+
+        Minecraft mc = Minecraft.getInstance();
+        TextureAtlasSprite topSprite = null;
+        TextureAtlasSprite sideSprite = null;
+        boolean topTinted = false;
+        boolean sideTinted = false;
+        int topTintIdx = -1;
+        int sideTintIdx = -1;
+
+        try {
+            BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
+            BlockStateModel model = modelSet.get(state);
+            if (model != null) {
+                palettePartsScratch.clear();
+                model.collectParts(paletteRandom, palettePartsScratch);
+                for (int i = 0; i < palettePartsScratch.size(); i++) {
+                    BlockStateModelPart part = palettePartsScratch.get(i);
+                    if (topSprite == null) {
+                        List<BakedQuad> upQuads = part.getQuads(Direction.UP);
+                        if (upQuads != null && !upQuads.isEmpty()) {
+                            BakedQuad.MaterialInfo mi = upQuads.get(0).materialInfo();
+                            topSprite = mi.sprite();
+                            topTinted = mi.isTinted();
+                            topTintIdx = mi.tintIndex();
+                        }
+                    }
+                    if (sideSprite == null) {
+                        List<BakedQuad> sideQuads = part.getQuads(Direction.NORTH);
+                        if (sideQuads != null && !sideQuads.isEmpty()) {
+                            BakedQuad.MaterialInfo mi = sideQuads.get(0).materialInfo();
+                            sideSprite = mi.sprite();
+                            sideTinted = mi.isTinted();
+                            sideTintIdx = mi.tintIndex();
+                        }
+                    }
+                    if (topSprite != null && sideSprite != null) break;
+                }
+                if (topSprite == null || sideSprite == null) {
+                    Material.Baked pm = model.particleMaterial();
+                    TextureAtlasSprite fallback = (pm != null) ? pm.sprite() : null;
+                    if (topSprite == null) topSprite = fallback;
+                    if (sideSprite == null) sideSprite = fallback;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (topSprite != null) {
+            int o0 = id * 4;
+            cpuPaletteLut[o0]     = topSprite.getU0();
+            cpuPaletteLut[o0 + 1] = topSprite.getV0();
+            cpuPaletteLut[o0 + 2] = topSprite.getU1() - topSprite.getU0();
+            cpuPaletteLut[o0 + 3] = topSprite.getV1() - topSprite.getV0();
+        }
+        if (sideSprite != null) {
+            int o1 = (PALETTE_MAX + id) * 4;
+            cpuPaletteLut[o1]     = sideSprite.getU0();
+            cpuPaletteLut[o1 + 1] = sideSprite.getV0();
+            cpuPaletteLut[o1 + 2] = sideSprite.getU1() - sideSprite.getU0();
+            cpuPaletteLut[o1 + 3] = sideSprite.getV1() - sideSprite.getV0();
+        }
+
+        float tr = 1.0f, tg = 1.0f, tb = 1.0f;
+        if (topTinted || sideTinted) {
+            int tintIdx = topTinted ? Math.max(0, topTintIdx) : Math.max(0, sideTintIdx);
+            try {
+                BlockColors bc = mc.getBlockColors();
+                BlockTintSource src = (bc != null) ? bc.getTintSource(state, tintIdx) : null;
+                int argb = (src != null) ? src.color(state) : -1;
+                if (argb != -1 && (argb & 0xFFFFFF) != 0) {
+                    tr = ((argb >> 16) & 0xFF) / 255.0f;
+                    tg = ((argb >> 8) & 0xFF) / 255.0f;
+                    tb = (argb & 0xFF) / 255.0f;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        int flags = (topTinted ? 1 : 0) | (sideTinted ? 2 : 0);
+        int o2 = (PALETTE_MAX * 2 + id) * 4;
+        cpuPaletteLut[o2]     = tr;
+        cpuPaletteLut[o2 + 1] = tg;
+        cpuPaletteLut[o2 + 2] = tb;
+        cpuPaletteLut[o2 + 3] = (float) flags;
+
+        paletteLutDirty = true;
+        return (short) id;
     }
 
     private static float[] classifyHeldEmissive(ItemStack stack) {
@@ -381,6 +734,10 @@ public final class RaindioLpvManager implements AutoCloseable {
                         cpuSubVoxel[sOff + 1] = 0;
                         subVoxelDirty = true;
                     }
+                    if (cpuVoxelPalette[idx] != 0) {
+                        cpuVoxelPalette[idx] = 0;
+                        voxelPaletteDirty = true;
+                    }
                 }
             }
         }
@@ -408,8 +765,11 @@ public final class RaindioLpvManager implements AutoCloseable {
             maskVal = 0;
         } else if (state.canOcclude() && state.isSolidRender()) {
             maskVal = 1;
+        } else if (b instanceof LeavesBlock) {
+            // maskVal = 19: foliage canopy (transparent to LPV/point-light GI, opaque to 3D RT reflections!)
+            maskVal = 19;
         } else if (!state.isAir() && state.getFluidState().isEmpty()
-                && !(b instanceof LeavesBlock) && !(b instanceof HalfTransparentBlock)) {
+                && !(b instanceof HalfTransparentBlock)) {
             scratchPos.set(wx, wy, wz);
             VoxelShape shape = state.getCollisionShape(level, scratchPos);
             if (!shape.isEmpty()) {
@@ -475,20 +835,20 @@ public final class RaindioLpvManager implements AutoCloseable {
             emG = toUByte(spec[1] * curPlTint[1]);
             emB = toUByte(spec[2] * curPlTint[2]);
             emA = toUByte(spec[3] * curPlIntensity * 0.25f); // intensity / 4.0
-        } else if (maskVal == 1) {
+        } else if (maskVal == 1 || maskVal == 18 || maskVal == 19) {
             int col = b.defaultMapColor().col;
             float r = ((col >> 16) & 0xFF) / 255.0f;
             float g = ((col >> 8) & 0xFF) / 255.0f;
             float bl = (col & 0xFF) / 255.0f;
             float lum = 0.2126f * r + 0.7152f * g + 0.0722f * bl;
-            float sat = 1.52f;
+            float sat = (maskVal == 19) ? 1.25f : 1.52f;
             r = Math.max(0.0f, Math.min(1.0f, lum + (r - lum) * sat));
             g = Math.max(0.0f, Math.min(1.0f, lum + (g - lum) * sat));
             bl = Math.max(0.0f, Math.min(1.0f, lum + (bl - lum) * sat));
             emR = toUByte((float) Math.pow(r, 1.5));
             emG = toUByte((float) Math.pow(g, 1.5));
             emB = toUByte((float) Math.pow(bl, 1.5));
-            emA = 0; // Strictly 0: distinguishes solid wall albedo from emissive blocks
+            emA = 0; // Strictly 0: distinguishes surface albedo from emissive blocks
         }
         // Merge player's held light inline on the player's air cell to avoid redundant dirty flips
         if (heldVoxelSpec != null && maskVal != 1 && wx == heldVoxelX && wy == heldVoxelY && wz == heldVoxelZ) {
@@ -509,6 +869,11 @@ public final class RaindioLpvManager implements AutoCloseable {
             cpuEmissive[eOff + 2] = emB;
             cpuEmissive[eOff + 3] = emA;
             emissiveDirty = true;
+        }
+        short palId = (maskVal == 1 || maskVal == 18 || maskVal == 19) ? resolveBlockPaletteId(state) : 0;
+        if (cpuVoxelPalette[idx] != palId) {
+            cpuVoxelPalette[idx] = palId;
+            voxelPaletteDirty = true;
         }
     }
 
@@ -626,6 +991,10 @@ public final class RaindioLpvManager implements AutoCloseable {
                 clearAndInit3DColor(cmd, stack, maskImage, true);
                 clearAndInit3DColor(cmd, stack, emImage, false);
                 clearAndInit3DColor(cmd, stack, subVoxelImage, true);
+                clearAndInit3DColor(cmd, stack, farVoxelImage, false);
+                clearAndInit3DColor(cmd, stack, paletteLutImage, false);
+                clearAndInit3DColor(cmd, stack, voxelPaletteImage, true);
+                clearAndInit3DColor(cmd, stack, farPaletteImage, true);
                 for (int i = 0; i < 2; i++) {
                     clearAndInit3DColor(cmd, stack, shRImg[i], false);
                     clearAndInit3DColor(cmd, stack, shGImg[i], false);
@@ -643,7 +1012,7 @@ public final class RaindioLpvManager implements AutoCloseable {
 
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            // 1. Upload only the 3D textures that actually changed this frame (skips up to 3.25 MB/frame when idle)
+            // 1. Upload only the textures that actually changed this frame
             if (maskDirty) {
                 upload3D(cmd, stack, maskStagingBufs[slot], maskStagingAllocs[slot], cpuMask, maskImage);
                 maskDirty = false;
@@ -655,6 +1024,22 @@ public final class RaindioLpvManager implements AutoCloseable {
             if (subVoxelDirty) {
                 upload3DInts(cmd, stack, subVoxelStagingBufs[slot], subVoxelStagingAllocs[slot], cpuSubVoxel, subVoxelImage);
                 subVoxelDirty = false;
+            }
+            if (farVoxelDirty) {
+                upload3D(cmd, stack, farVoxelStagingBufs[slot], farVoxelStagingAllocs[slot], cpuFarVoxel, farVoxelImage, FAR_XZ, FAR_Y, FAR_XZ);
+                farVoxelDirty = false;
+            }
+            if (paletteLutDirty) {
+                upload2DFloats(cmd, stack, paletteLutStagingBufs[slot], paletteLutStagingAllocs[slot], cpuPaletteLut, paletteLutImage, PALETTE_MAX, 3);
+                paletteLutDirty = false;
+            }
+            if (voxelPaletteDirty) {
+                upload3DShorts(cmd, stack, voxelPaletteStagingBufs[slot], voxelPaletteStagingAllocs[slot], cpuVoxelPalette, voxelPaletteImage, GRID_SIZE, GRID_SIZE, GRID_SIZE);
+                voxelPaletteDirty = false;
+            }
+            if (farPaletteDirty) {
+                upload3DShorts(cmd, stack, farPaletteStagingBufs[slot], farPaletteStagingAllocs[slot], cpuFarPalette, farPaletteImage, FAR_XZ, FAR_Y, FAR_XZ);
+                farPaletteDirty = false;
             }
 
             // 2. Run 1..4 rounds of 6-neighbor unified L1 SH-LPV propagation (ping-pong A <-> B)
@@ -704,6 +1089,14 @@ public final class RaindioLpvManager implements AutoCloseable {
             VkCommandBuffer cmd, MemoryStack stack,
             long stagingBuf, long stagingAlloc, byte[] srcBytes, long dstImage
     ) {
+        upload3D(cmd, stack, stagingBuf, stagingAlloc, srcBytes, dstImage, GRID_SIZE, GRID_SIZE, GRID_SIZE);
+    }
+
+    private void upload3D(
+            VkCommandBuffer cmd, MemoryStack stack,
+            long stagingBuf, long stagingAlloc, byte[] srcBytes, long dstImage,
+            int extW, int extH, int extD
+    ) {
         PointerBuffer pMapped = stack.mallocPointer(1);
         checkVk(Vma.vmaMapMemory(vmaAllocator, stagingAlloc, pMapped), "vmaMapMemory(LPV3D)");
         ByteBuffer dst = MemoryUtil.memByteBuffer(pMapped.get(0), srcBytes.length);
@@ -719,7 +1112,7 @@ public final class RaindioLpvManager implements AutoCloseable {
         region.bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
         region.imageSubresource().aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
         region.imageOffset().set(0, 0, 0);
-        region.imageExtent().set(GRID_SIZE, GRID_SIZE, GRID_SIZE);
+        region.imageExtent().set(extW, extH, extD);
 
         VK12.vkCmdCopyBufferToImage(cmd, stagingBuf, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
 
@@ -749,6 +1142,66 @@ public final class RaindioLpvManager implements AutoCloseable {
         region.imageSubresource().aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
         region.imageOffset().set(0, 0, 0);
         region.imageExtent().set(GRID_SIZE, GRID_SIZE, GRID_SIZE);
+
+        VK12.vkCmdCopyBufferToImage(cmd, stagingBuf, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+        transition3D(cmd, stack, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK12.VK_IMAGE_LAYOUT_GENERAL,
+                VK12.VK_ACCESS_TRANSFER_WRITE_BIT, VK12.VK_ACCESS_SHADER_READ_BIT,
+                VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    private void upload3DShorts(
+            VkCommandBuffer cmd, MemoryStack stack,
+            long stagingBuf, long stagingAlloc, short[] srcShorts, long dstImage,
+            int extW, int extH, int extD
+    ) {
+        int byteLen = srcShorts.length * 2;
+        PointerBuffer pMapped = stack.mallocPointer(1);
+        checkVk(Vma.vmaMapMemory(vmaAllocator, stagingAlloc, pMapped), "vmaMapMemory(LPVPalette3D)");
+        ShortBuffer dst = MemoryUtil.memShortBuffer(pMapped.get(0), srcShorts.length);
+        dst.put(srcShorts);
+        Vma.vmaFlushAllocation(vmaAllocator, stagingAlloc, 0, byteLen);
+        Vma.vmaUnmapMemory(vmaAllocator, stagingAlloc);
+
+        transition3D(cmd, stack, dstImage, VK12.VK_IMAGE_LAYOUT_GENERAL, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK12.VK_ACCESS_SHADER_READ_BIT, VK12.VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK12.VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
+        region.bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+        region.imageSubresource().aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+        region.imageOffset().set(0, 0, 0);
+        region.imageExtent().set(extW, extH, extD);
+
+        VK12.vkCmdCopyBufferToImage(cmd, stagingBuf, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+        transition3D(cmd, stack, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK12.VK_IMAGE_LAYOUT_GENERAL,
+                VK12.VK_ACCESS_TRANSFER_WRITE_BIT, VK12.VK_ACCESS_SHADER_READ_BIT,
+                VK12.VK_PIPELINE_STAGE_TRANSFER_BIT, VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    private void upload2DFloats(
+            VkCommandBuffer cmd, MemoryStack stack,
+            long stagingBuf, long stagingAlloc, float[] srcFloats, long dstImage,
+            int extW, int extH
+    ) {
+        int byteLen = srcFloats.length * 4;
+        PointerBuffer pMapped = stack.mallocPointer(1);
+        checkVk(Vma.vmaMapMemory(vmaAllocator, stagingAlloc, pMapped), "vmaMapMemory(PaletteLut2D)");
+        FloatBuffer dst = MemoryUtil.memFloatBuffer(pMapped.get(0), srcFloats.length);
+        dst.put(srcFloats);
+        Vma.vmaFlushAllocation(vmaAllocator, stagingAlloc, 0, byteLen);
+        Vma.vmaUnmapMemory(vmaAllocator, stagingAlloc);
+
+        transition3D(cmd, stack, dstImage, VK12.VK_IMAGE_LAYOUT_GENERAL, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK12.VK_ACCESS_SHADER_READ_BIT, VK12.VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK12.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK12.VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
+        region.bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+        region.imageSubresource().aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+        region.imageOffset().set(0, 0, 0);
+        region.imageExtent().set(extW, extH, 1);
 
         VK12.vkCmdCopyBufferToImage(cmd, stagingBuf, dstImage, VK12.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
 
@@ -848,6 +1301,22 @@ public final class RaindioLpvManager implements AutoCloseable {
                     VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT);
             this.subVoxelImage = sv[0]; this.subVoxelAlloc = sv[1]; this.subVoxelView = sv[2];
 
+            long[] fv = create3DImage(stack, VK12.VK_FORMAT_R8G8B8A8_UNORM,
+                    VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT, FAR_XZ, FAR_Y, FAR_XZ);
+            this.farVoxelImage = fv[0]; this.farVoxelAlloc = fv[1]; this.farVoxelView = fv[2];
+
+            long[] plut = create2DImage(stack, VK12.VK_FORMAT_R32G32B32A32_SFLOAT,
+                    VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT, PALETTE_MAX, 3);
+            this.paletteLutImage = plut[0]; this.paletteLutAlloc = plut[1]; this.paletteLutView = plut[2];
+
+            long[] vp = create3DImage(stack, VK12.VK_FORMAT_R16_UINT,
+                    VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT, GRID_SIZE, GRID_SIZE, GRID_SIZE);
+            this.voxelPaletteImage = vp[0]; this.voxelPaletteAlloc = vp[1]; this.voxelPaletteView = vp[2];
+
+            long[] fp = create3DImage(stack, VK12.VK_FORMAT_R16_UINT,
+                    VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT, FAR_XZ, FAR_Y, FAR_XZ);
+            this.farPaletteImage = fp[0]; this.farPaletteAlloc = fp[1]; this.farPaletteView = fp[2];
+
             int shUsage = VK12.VK_IMAGE_USAGE_STORAGE_BIT | VK12.VK_IMAGE_USAGE_SAMPLED_BIT | VK12.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             for (int i = 0; i < 2; i++) {
                 long[] r = create3DImage(stack, VK12.VK_FORMAT_R16G16B16A16_SFLOAT, shUsage);
@@ -860,7 +1329,7 @@ public final class RaindioLpvManager implements AutoCloseable {
                 shBImg[i] = b[0]; shBAlloc[i] = b[1]; shBView[i] = b[2];
             }
 
-            // Allocate 4-frame staging buffers for mask (256KB), emissive (1MB), and 4x4x4 sub-voxel (2MB)
+            // Allocate 4-frame staging buffers for voxel grids & palette-indexed block atlas LUT
             for (int i = 0; i < RING_SIZE; i++) {
                 long[] mb = createStagingBuffer(stack, MASK_BYTES);
                 maskStagingBufs[i] = mb[0]; maskStagingAllocs[i] = mb[1];
@@ -870,6 +1339,18 @@ public final class RaindioLpvManager implements AutoCloseable {
 
                 long[] svb = createStagingBuffer(stack, SUBVOXEL_BYTES);
                 subVoxelStagingBufs[i] = svb[0]; subVoxelStagingAllocs[i] = svb[1];
+
+                long[] fvb = createStagingBuffer(stack, FAR_VOXEL_BYTES);
+                farVoxelStagingBufs[i] = fvb[0]; farVoxelStagingAllocs[i] = fvb[1];
+
+                long[] plb = createStagingBuffer(stack, PALETTE_LUT_BYTES);
+                paletteLutStagingBufs[i] = plb[0]; paletteLutStagingAllocs[i] = plb[1];
+
+                long[] vpb = createStagingBuffer(stack, VOXEL_PALETTE_BYTES);
+                voxelPaletteStagingBufs[i] = vpb[0]; voxelPaletteStagingAllocs[i] = vpb[1];
+
+                long[] fpb = createStagingBuffer(stack, FAR_PALETTE_BYTES);
+                farPaletteStagingBufs[i] = fpb[0]; farPaletteStagingAllocs[i] = fpb[1];
             }
         }
 
@@ -878,6 +1359,10 @@ public final class RaindioLpvManager implements AutoCloseable {
     }
 
     private long[] create3DImage(MemoryStack stack, int format, int usage) {
+        return create3DImage(stack, format, usage, GRID_SIZE, GRID_SIZE, GRID_SIZE);
+    }
+
+    private long[] create3DImage(MemoryStack stack, int format, int usage, int extW, int extH, int extD) {
         VkImageCreateInfo imgInfo = VkImageCreateInfo.calloc(stack)
                 .sType$Default()
                 .imageType(VK12.VK_IMAGE_TYPE_3D)
@@ -889,7 +1374,7 @@ public final class RaindioLpvManager implements AutoCloseable {
                 .usage(usage)
                 .sharingMode(VK12.VK_SHARING_MODE_EXCLUSIVE)
                 .initialLayout(VK12.VK_IMAGE_LAYOUT_UNDEFINED);
-        imgInfo.extent().set(GRID_SIZE, GRID_SIZE, GRID_SIZE);
+        imgInfo.extent().set(extW, extH, extD);
 
         VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
                 .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
@@ -912,6 +1397,44 @@ public final class RaindioLpvManager implements AutoCloseable {
 
         LongBuffer pView = stack.mallocLong(1);
         checkVk(VK12.vkCreateImageView(vkDevice, viewInfo, null, pView), "vkCreateImageView(LPV3D)");
+        return new long[] { image, alloc, pView.get(0) };
+    }
+
+    private long[] create2DImage(MemoryStack stack, int format, int usage, int extW, int extH) {
+        VkImageCreateInfo imgInfo = VkImageCreateInfo.calloc(stack)
+                .sType$Default()
+                .imageType(VK12.VK_IMAGE_TYPE_2D)
+                .format(format)
+                .mipLevels(1)
+                .arrayLayers(1)
+                .samples(VK12.VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK12.VK_IMAGE_TILING_OPTIMAL)
+                .usage(usage)
+                .sharingMode(VK12.VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK12.VK_IMAGE_LAYOUT_UNDEFINED);
+        imgInfo.extent().set(extW, extH, 1);
+
+        VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
+                .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        LongBuffer pImg = stack.mallocLong(1);
+        PointerBuffer pAlloc = stack.mallocPointer(1);
+        checkVk(Vma.vmaCreateImage(vmaAllocator, imgInfo, allocInfo, pImg, pAlloc, null), "vmaCreateImage(PaletteLut2D)");
+        long image = pImg.get(0);
+        long alloc = pAlloc.get(0);
+
+        VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
+                .sType$Default()
+                .image(image)
+                .viewType(VK12.VK_IMAGE_VIEW_TYPE_2D)
+                .format(format);
+        viewInfo.subresourceRange()
+                .aspectMask(VK12.VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1)
+                .baseArrayLayer(0).layerCount(1);
+
+        LongBuffer pView = stack.mallocLong(1);
+        checkVk(VK12.vkCreateImageView(vkDevice, viewInfo, null, pView), "vkCreateImageView(PaletteLut2D)");
         return new long[] { image, alloc, pView.get(0) };
     }
 
@@ -1096,11 +1619,16 @@ public final class RaindioLpvManager implements AutoCloseable {
     public void close() {
         lastLevel = null;
         originX = originY = originZ = Integer.MIN_VALUE;
+        farOriginX = farOriginY = farOriginZ = Integer.MIN_VALUE;
         if (vkDevice != null) {
             VK12.vkDeviceWaitIdle(vkDevice);
             destroyImage(maskImage, maskAlloc, maskView); maskImage = maskView = VK12.VK_NULL_HANDLE; maskAlloc = 0L;
             destroyImage(emImage, emAlloc, emView); emImage = emView = VK12.VK_NULL_HANDLE; emAlloc = 0L;
             destroyImage(subVoxelImage, subVoxelAlloc, subVoxelView); subVoxelImage = subVoxelView = VK12.VK_NULL_HANDLE; subVoxelAlloc = 0L;
+            destroyImage(farVoxelImage, farVoxelAlloc, farVoxelView); farVoxelImage = farVoxelView = VK12.VK_NULL_HANDLE; farVoxelAlloc = 0L;
+            destroyImage(paletteLutImage, paletteLutAlloc, paletteLutView); paletteLutImage = paletteLutView = VK12.VK_NULL_HANDLE; paletteLutAlloc = 0L;
+            destroyImage(voxelPaletteImage, voxelPaletteAlloc, voxelPaletteView); voxelPaletteImage = voxelPaletteView = VK12.VK_NULL_HANDLE; voxelPaletteAlloc = 0L;
+            destroyImage(farPaletteImage, farPaletteAlloc, farPaletteView); farPaletteImage = farPaletteView = VK12.VK_NULL_HANDLE; farPaletteAlloc = 0L;
             for (int i = 0; i < 2; i++) {
                 destroyImage(shRImg[i], shRAlloc[i], shRView[i]); shRImg[i] = shRView[i] = VK12.VK_NULL_HANDLE; shRAlloc[i] = 0L;
                 destroyImage(shGImg[i], shGAlloc[i], shGView[i]); shGImg[i] = shGView[i] = VK12.VK_NULL_HANDLE; shGAlloc[i] = 0L;
@@ -1118,6 +1646,22 @@ public final class RaindioLpvManager implements AutoCloseable {
                 if (subVoxelStagingBufs[i] != VK12.VK_NULL_HANDLE) {
                     Vma.vmaDestroyBuffer(vmaAllocator, subVoxelStagingBufs[i], subVoxelStagingAllocs[i]);
                     subVoxelStagingBufs[i] = VK12.VK_NULL_HANDLE; subVoxelStagingAllocs[i] = 0L;
+                }
+                if (farVoxelStagingBufs[i] != VK12.VK_NULL_HANDLE) {
+                    Vma.vmaDestroyBuffer(vmaAllocator, farVoxelStagingBufs[i], farVoxelStagingAllocs[i]);
+                    farVoxelStagingBufs[i] = VK12.VK_NULL_HANDLE; farVoxelStagingAllocs[i] = 0L;
+                }
+                if (paletteLutStagingBufs[i] != VK12.VK_NULL_HANDLE) {
+                    Vma.vmaDestroyBuffer(vmaAllocator, paletteLutStagingBufs[i], paletteLutStagingAllocs[i]);
+                    paletteLutStagingBufs[i] = VK12.VK_NULL_HANDLE; paletteLutStagingAllocs[i] = 0L;
+                }
+                if (voxelPaletteStagingBufs[i] != VK12.VK_NULL_HANDLE) {
+                    Vma.vmaDestroyBuffer(vmaAllocator, voxelPaletteStagingBufs[i], voxelPaletteStagingAllocs[i]);
+                    voxelPaletteStagingBufs[i] = VK12.VK_NULL_HANDLE; voxelPaletteStagingAllocs[i] = 0L;
+                }
+                if (farPaletteStagingBufs[i] != VK12.VK_NULL_HANDLE) {
+                    Vma.vmaDestroyBuffer(vmaAllocator, farPaletteStagingBufs[i], farPaletteStagingAllocs[i]);
+                    farPaletteStagingBufs[i] = VK12.VK_NULL_HANDLE; farPaletteStagingAllocs[i] = 0L;
                 }
             }
             if (nearestRepeatSampler != VK12.VK_NULL_HANDLE) { VK12.vkDestroySampler(vkDevice, nearestRepeatSampler, null); nearestRepeatSampler = VK12.VK_NULL_HANDLE; }
