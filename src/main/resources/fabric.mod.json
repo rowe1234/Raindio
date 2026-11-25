@@ -7,7 +7,7 @@
   "authors": [
     "Rowe"
   ],
-  "license": "All-Rights-Reserved",
+  "license": "MIT",
   "environment": "client",
   "entrypoints": {
     "client": [
