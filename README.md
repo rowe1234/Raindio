@@ -44,7 +44,7 @@
 
 ## 快捷键与画质预设
 
-- **`F9`**：打开 Raindio 配置界面（支持 `Low` / `Balanced` / `High` / `Cinematic` 四档预设、渲染缩放、阴影分辨率、超分模式、体积云、点光源色温与强度等参数，自动持久化至 `config/raindio.json`）。
+- **`J`**：打开 Raindio 配置界面（支持 `Low` / `Balanced` / `High` / `Cinematic` 四档预设、渲染缩放、阴影分辨率、超分模式、体积云、点光源色温与强度等参数，自动持久化至 `config/raindio.json`）。
 - **`K`**：一键开关光影管线（出错后也可按 `K` 重试）。
 - **`F8`**：循环切换内置调试视图（`DEBUG_VIEW 0..16`，包含法线、水体、光追反射、GTAO、Compute GI、点光源、自动曝光 HUD 等）。
 
