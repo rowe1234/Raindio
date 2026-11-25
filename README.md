@@ -1,6 +1,6 @@
 # Raindio Shaders (`raindio-mod`)
 
-面向 **Minecraft 26.3（原生 RenderPearl Vulkan 后端）** 的独立 Fabric 光影模组，无需 Iris、Sodium 或 VulkanMod 依赖，专为 Apple Silicon（MoltenVK）与桌面 Vulkan GPU 打造。
+面向 **Minecraft 26.3（原生 Vulkan 后端）** 的独立 Fabric 光影模组，无需额外第三方光影加载器，专为 Apple Silicon（MoltenVK）与桌面 Vulkan GPU 打造。
 
 ## 核心特性
 
@@ -10,12 +10,12 @@
   - **混合光追 GI**：屏幕空间反弹（2 步二分细化 + 背面剔除）结合 16 步 3D 体素 DDA 离屏反弹与天空可见性追踪，并通过几何半球校验（`uCurGiPos` / `uInGiPos`）完成空间复用。
 - **64³ 环形网格 L1 SH-LPV 全局光照**
   - `lpv_propagate.comp` 实时传播多反弹彩色墙面漫反射、16 色染色玻璃滤光及 RSM 太阳光地表反弹（`shadowtex0` + `shadowcolor0`）。
-- **高质量阴影、水体与大气渲染**
+- **高质量阴影、物理水体与大气渲染**
   - 接触硬化 **PCSS 软阴影**（动态分辨率 `1024 / 2048 / 4096`，Vogel Disk 阻塞搜索与 PCF）。
-  - **SEUS PTGI 风格水体**：Snell 折射、Beer-Lambert 光谱吸收、色散与海底焦散、波峰次表面散射、SSR + 阴影贴图 RSM 离屏反射回退。
+  - **基于物理的动态水体渲染**：波浪视差与法线微表面细节、Snell 折射、Beer-Lambert 光谱吸收、色散与海底焦散、波峰次表面散射、SSR + 阴影贴图 RSM 离屏反射回退。
   - 128×64 大气散射 LUT、体积云、空气与水下体积光束、雨天湿滑地面水洼反射与 GTAO。
 - **超分、抗锯齿与后期调色**
-  - 原生 HDR 运动矢量 **TAA / TAAU**（Halton 抖动 + YCoCg 方差裁剪 + Catmull-Rom 历史采样）、**FSR 1.0 EASU + RCAS** 与 FXAA 回退，支持 `0.50x–1.00x` 内部分辨率缩放同时保持 UI 清晰。
+  - 原生 HDR 运动矢量 **TAA / TAAU**（Halton 抖动 + YCoCg 方差裁剪 + Catmull-Rom 历史采样）、边缘自适应空间超分（EASU）与对比度自适应锐化（RCAS），以及 FXAA 回退，支持 `0.50x–1.00x` 内部分辨率缩放同时保持 UI 清晰。
   - GPU 亮度直方图自动曝光（`histogram_build.comp` + `histogram_adapt.comp`）、双层 Bloom 与 **AgX Filmic** 色调映射。
 
 ## 运行环境要求
@@ -52,13 +52,13 @@ src/main/
 ├── java/com/raindio/
 │   ├── client/      # F9 配置界面与快捷键
 │   ├── config/      # 画质预设与 JSON 配置持久化
-│   ├── mixin/       # RenderPearl / LevelRenderer / GameRenderer 钩子
+│   ├── mixin/       # 渲染管线与游戏渲染器钩子
 │   ├── pipeline/    # 帧生命周期调度
 │   └── vulkan/      # Vulkan 附件、UBO、LPV、ReSTIR DI/GI、自动曝光与管线管理
 └── shaders/
     ├── chunks/      # 阴影、地形、水体、透明层、实体与第一人称手部 G-Buffer
     ├── common/      # 全局 Uniform 与全屏顶点着色器
-    ├── composite/   # 大气 LUT、水体、SSR/GTAO、主合成、Bloom、TAAU、FSR、AgX/RCAS
+    ├── composite/   # 大气 LUT、水体、SSR/GTAO、主合成、Bloom、TAAU、EASU/RCAS、AgX
     ├── compute/     # ReSTIR DI/GI、LPV 传播与亮度直方图自动曝光计算着色器
     └── lib/         # 公共数学、投影、光照、PBR、水体、SSR、体积光与天空库
 ```
